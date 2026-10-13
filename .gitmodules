@@ -1,0 +1,3 @@
+[submodule "src/prana_description"]
+	path = src/prana_description
+	url = git@github.com:Srishti-2024/prana_description.git
