@@ -7,4 +7,10 @@ install(DIRECTORY scripts/prana_recovery
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  scripts/train_prana_recovery.py
+  scripts/evaluate_prana_recovery.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
