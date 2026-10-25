@@ -27,15 +27,25 @@ def parse_args() -> argparse.Namespace:
         default=0.65,
         help="Vertical terrain relief in metres; higher values produce steeper terrain (default: 0.65)",
     )
+    parser.add_argument(
+        "--spawn-clearance",
+        type=float,
+        default=1.15,
+        help="Initial rover-root height above sampled terrain in metres (default: 1.15)",
+    )
     parser.add_argument("--render", action="store_true", help="Show selected real PPO workers in one live grid window")
     parser.add_argument("--render-envs", type=int, default=4, help="Maximum workers to display with --render")
     parser.add_argument("--render-every", type=int, default=25, help="Render every N vector-environment steps")
     return parser.parse_args()
 
 
-def make_env(seed: int, terrain_config: TerrainConfig):
+def make_env(seed: int, terrain_config: TerrainConfig, spawn_clearance_m: float):
     def factory() -> PranaRecoveryEnv:
-        return PranaRecoveryEnv(terrain_config=terrain_config, seed=seed)
+        return PranaRecoveryEnv(
+            terrain_config=terrain_config,
+            spawn_clearance_m=spawn_clearance_m,
+            seed=seed,
+        )
     return factory
 
 
@@ -53,11 +63,11 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     if args.render_envs < 1 or args.render_every < 1:
         raise SystemExit("--render-envs and --render-every must both be positive.")
-    if args.terrain_height_range <= 0.0:
-        raise SystemExit("--terrain-height-range must be positive.")
+    if args.terrain_height_range <= 0.0 or args.spawn_clearance <= 0.0:
+        raise SystemExit("--terrain-height-range and --spawn-clearance must both be positive.")
     terrain_config = TerrainConfig(height_range_m=args.terrain_height_range)
     environment = SubprocVecEnv(
-        [make_env(args.seed + index, terrain_config) for index in range(args.num_envs)]
+        [make_env(args.seed + index, terrain_config, args.spawn_clearance) for index in range(args.num_envs)]
     )
     model = PPO(
         "MlpPolicy",

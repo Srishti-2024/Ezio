@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
         default=0.65,
         help="Must match the terrain relief used during training (default: 0.65)",
     )
+    parser.add_argument(
+        "--spawn-clearance",
+        type=float,
+        default=1.15,
+        help="Initial rover-root height above sampled terrain in metres (default: 1.15)",
+    )
     return parser.parse_args()
 
 
@@ -34,10 +40,11 @@ def main() -> None:
     except ImportError as error:
         raise SystemExit("Install requirements-training.txt before evaluating a PPO model.") from error
 
-    if args.terrain_height_range <= 0.0:
-        raise SystemExit("--terrain-height-range must be positive.")
+    if args.terrain_height_range <= 0.0 or args.spawn_clearance <= 0.0:
+        raise SystemExit("--terrain-height-range and --spawn-clearance must both be positive.")
     environment = PranaRecoveryEnv(
         terrain_config=TerrainConfig(height_range_m=args.terrain_height_range),
+        spawn_clearance_m=args.spawn_clearance,
         seed=args.seed,
     )
     policy = PPO.load(args.model)

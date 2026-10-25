@@ -44,6 +44,7 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         terrain_episodes: int = 8,
         control_dt_s: float = 0.05,
         max_episode_steps: int = 300,
+        spawn_clearance_m: float = 1.15,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -51,6 +52,9 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         self.terrain_episodes = terrain_episodes
         self.control_dt_s = control_dt_s
         self.max_episode_steps = max_episode_steps
+        if spawn_clearance_m <= 0.0:
+            raise ValueError("spawn_clearance_m must be positive.")
+        self.spawn_clearance_m = spawn_clearance_m
         self._rng = np.random.default_rng(seed)
         self._temporary_directory = tempfile.TemporaryDirectory(prefix="prana_recovery_")
         self._model: mujoco.MjModel | None = None
@@ -135,7 +139,7 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         qpos[self._free_joint_qposadr : self._free_joint_qposadr + 3] = (
             spawn_x,
             spawn_y,
-            self._terrain.height_at(spawn_x, spawn_y) + 0.86,
+            self._terrain.height_at(spawn_x, spawn_y) + self.spawn_clearance_m,
         )
         half_yaw = self._scenario.spawn_yaw_rad * 0.5
         qpos[self._free_joint_qposadr + 3 : self._free_joint_qposadr + 7] = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
