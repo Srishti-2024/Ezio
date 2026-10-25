@@ -24,6 +24,11 @@ wheel commands. Its observation contains the body-frame egress target, base
 linear and angular velocity, roll/pitch, steering state, wheel speeds, and 16
 short-range MuJoCo ray distances.
 
+Terrain relief defaults to `0.65` metres over the 16×16 metre heightfield.
+Use `--terrain-height-range` to make the terrain steeper. For example, start
+with `1.0` metres or `1.2` metres; use the same value for training and
+evaluation.
+
 The terrain generator and sampler have no PPO dependency. A later focused
 scenario family can be added beside `ScenarioSampler`, then selected by a new
 environment configuration without changing the controller, rewards, or PPO
@@ -53,7 +58,8 @@ Run from the workspace root:
 
 ```bash
 python3 src/prana_recovery/scripts/train_prana_recovery.py \
-  --num-envs 8 --timesteps 2000000 --device cuda
+  --num-envs 8 --timesteps 2000000 --device cuda \
+  --terrain-height-range 1.2
 ```
 
 Training outputs the PPO policy and TensorBoard logs below `runs/prana_recovery`.
@@ -61,7 +67,8 @@ Evaluate a saved policy against a repeatable suite:
 
 ```bash
 python3 src/prana_recovery/scripts/evaluate_prana_recovery.py \
-  runs/prana_recovery/ppo_prana_recovery --episodes 50 --seed 10000
+  runs/prana_recovery/ppo_prana_recovery --episodes 50 --seed 10000 \
+  --terrain-height-range 1.2
 ```
 
 The first version intentionally uses slope and roughness as a fast spawn

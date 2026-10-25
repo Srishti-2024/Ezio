@@ -10,6 +10,7 @@ import sys
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from prana_recovery.env import PranaRecoveryEnv
+from prana_recovery.terrain import TerrainConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -17,6 +18,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("model", type=Path, help="PPO model path, with or without the .zip suffix")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--seed", type=int, default=10_000, help="Evaluation seed; keep fixed for comparisons")
+    parser.add_argument(
+        "--terrain-height-range",
+        type=float,
+        default=0.65,
+        help="Must match the terrain relief used during training (default: 0.65)",
+    )
     return parser.parse_args()
 
 
@@ -27,7 +34,12 @@ def main() -> None:
     except ImportError as error:
         raise SystemExit("Install requirements-training.txt before evaluating a PPO model.") from error
 
-    environment = PranaRecoveryEnv(seed=args.seed)
+    if args.terrain_height_range <= 0.0:
+        raise SystemExit("--terrain-height-range must be positive.")
+    environment = PranaRecoveryEnv(
+        terrain_config=TerrainConfig(height_range_m=args.terrain_height_range),
+        seed=args.seed,
+    )
     policy = PPO.load(args.model)
     successes = 0
     returns: list[float] = []
