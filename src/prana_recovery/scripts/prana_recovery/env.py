@@ -36,7 +36,7 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
     by the interactive viewer.
     """
 
-    metadata = {"render_modes": []}
+    metadata = {"render_modes": ["rgb_array"]}
 
     def __init__(
         self,
@@ -65,6 +65,7 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         self._free_joint_qposadr = 0
         self._free_joint_dofadr = 0
         self._substeps = 1
+        self._renderer: mujoco.Renderer | None = None
 
         # target XY (2), base linear and angular velocity (6), pitch and roll
         # (2), steering joints (4), wheel velocities (4), 16 ray distances.
@@ -238,5 +239,29 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
             "tipped": tipped,
         }
 
+    def render(self) -> np.ndarray:
+        """Return an RGB image of this worker's current MuJoCo state.
+
+        Training remains headless unless a caller explicitly requests these
+        frames.  The live-training viewer uses this method to tile frames from
+        several real ``SubprocVecEnv`` workers into one window.
+        """
+        if self._model is None or self._data is None:
+            raise RuntimeError("Call reset() before rendering the environment.")
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(self._model, height=288, width=384)
+
+        camera = mujoco.MjvCamera()
+        camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        camera.lookat[:] = self._data.body("prana_mark2_v2").xpos
+        camera.distance = 3.2
+        camera.azimuth = 135.0
+        camera.elevation = -28.0
+        self._renderer.update_scene(self._data, camera=camera)
+        return self._renderer.render()
+
     def close(self) -> None:
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
         self._temporary_directory.cleanup()

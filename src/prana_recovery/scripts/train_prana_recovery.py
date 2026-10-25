@@ -10,6 +10,7 @@ import sys
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from prana_recovery.env import PranaRecoveryEnv
+from prana_recovery.training_viewer import TrainingMosaicCallback
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,6 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", default="auto", help="PPO device: auto, cpu, cuda, or cuda:0")
     parser.add_argument("--output", type=Path, default=Path("runs/prana_recovery"))
+    parser.add_argument("--render", action="store_true", help="Show selected real PPO workers in one live grid window")
+    parser.add_argument("--render-envs", type=int, default=4, help="Maximum workers to display with --render")
+    parser.add_argument("--render-every", type=int, default=25, help="Render every N vector-environment steps")
     return parser.parse_args()
 
 
@@ -40,6 +44,8 @@ def main() -> None:
         ) from error
 
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.render_envs < 1 or args.render_every < 1:
+        raise SystemExit("--render-envs and --render-every must both be positive.")
     environment = SubprocVecEnv([make_env(args.seed + index) for index in range(args.num_envs)])
     model = PPO(
         "MlpPolicy",
@@ -51,8 +57,14 @@ def main() -> None:
         n_steps=1024,
         batch_size=256,
     )
+    callback = None
+    if args.render:
+        callback = TrainingMosaicCallback(
+            every_steps=args.render_every,
+            worker_count=min(args.render_envs, args.num_envs),
+        )
     try:
-        model.learn(total_timesteps=args.timesteps, progress_bar=True)
+        model.learn(total_timesteps=args.timesteps, progress_bar=True, callback=callback)
         model.save(str(args.output / "ppo_prana_recovery"))
     finally:
         environment.close()
