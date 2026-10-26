@@ -68,3 +68,34 @@ class TrainingMosaicCallback:
                     self._plt.ioff()
 
         return _Callback()
+
+
+class EvaluationFrameViewer:
+    """A small live window for the one MuJoCo world used by evaluation."""
+
+    def __init__(self) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError("Live evaluation display needs matplotlib.") from error
+
+        self._plt = plt
+        self._plt.ion()
+        self._figure, self._axis = self._plt.subplots(figsize=(6.4, 4.8))
+        self._axis.set_axis_off()
+        self._image = None
+        self._figure.canvas.manager.set_window_title("Prana PPO evaluation")
+        self._figure.tight_layout()
+
+    def update(self, frame, *, episode: int, step: int) -> None:
+        if self._image is None:
+            self._image = self._axis.imshow(frame)
+        else:
+            self._image.set_data(frame)
+        self._axis.set_title(f"Evaluation episode {episode}, step {step}")
+        self._figure.canvas.draw_idle()
+        self._figure.canvas.flush_events()
+        self._plt.pause(0.001)
+
+    def close(self) -> None:
+        self._plt.ioff()
