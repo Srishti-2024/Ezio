@@ -26,10 +26,12 @@ def parse_args() -> argparse.Namespace:
         help="Must match the terrain relief used during training (default: 0.65)",
     )
     parser.add_argument(
+        "--spawn-contact-clearance",
         "--spawn-clearance",
+        dest="spawn_contact_clearance",
         type=float,
-        default=1.15,
-        help="Initial rover-root height above sampled terrain in metres (default: 1.15)",
+        default=0.015,
+        help="Wheel-to-terrain clearance at spawn in metres (default: 0.015)",
     )
     parser.add_argument("--render", action="store_true", help="Show the live MuJoCo evaluation episode")
     parser.add_argument(
@@ -60,11 +62,11 @@ def main() -> None:
         raise SystemExit("Evaluation runs one environment, so --render-envs must be 1.")
     if args.render_every < 1:
         raise SystemExit("--render-every must be positive.")
-    if args.terrain_height_range <= 0.0 or args.spawn_clearance <= 0.0:
-        raise SystemExit("--terrain-height-range and --spawn-clearance must both be positive.")
+    if args.terrain_height_range <= 0.0 or args.spawn_contact_clearance < 0.0:
+        raise SystemExit("--terrain-height-range must be positive and --spawn-contact-clearance cannot be negative.")
     environment = PranaRecoveryEnv(
         terrain_config=TerrainConfig(height_range_m=args.terrain_height_range),
-        spawn_clearance_m=args.spawn_clearance,
+        spawn_contact_clearance_m=args.spawn_contact_clearance,
         seed=args.seed,
     )
     policy = PPO.load(args.model)

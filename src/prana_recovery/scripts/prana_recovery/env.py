@@ -24,7 +24,7 @@ DESCRIPTION_SCRIPTS = SOURCE_ROOT / "prana_description" / "scripts"
 
 sys.path.insert(0, str(DRIVE_SCRIPTS))
 sys.path.insert(0, str(DESCRIPTION_SCRIPTS))
-from prana_mujoco_teleop import actuator_ids, apply_twist  # noqa: E402
+from prana_mujoco_teleop import WHEEL_NAMES, WHEEL_POSITIONS_M, WHEEL_RADIUS_M, actuator_ids, apply_twist  # noqa: E402
 import mujoco_sim_mark2_v2 as rover_sim  # noqa: E402
 
 
@@ -44,7 +44,10 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         terrain_episodes: int = 8,
         control_dt_s: float = 0.05,
         max_episode_steps: int = 300,
-        spawn_clearance_m: float = 1.15,
+        spawn_contact_clearance_m: float = 0.015,
+        settle_max_steps: int = 750,
+        settle_stable_steps: int = 50,
+        spawn_attempts: int = 10,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -52,9 +55,14 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         self.terrain_episodes = terrain_episodes
         self.control_dt_s = control_dt_s
         self.max_episode_steps = max_episode_steps
-        if spawn_clearance_m <= 0.0:
-            raise ValueError("spawn_clearance_m must be positive.")
-        self.spawn_clearance_m = spawn_clearance_m
+        if spawn_contact_clearance_m < 0.0:
+            raise ValueError("spawn_contact_clearance_m must not be negative.")
+        if settle_max_steps < 1 or settle_stable_steps < 1 or spawn_attempts < 1:
+            raise ValueError("settling and spawn attempt counts must be positive.")
+        self.spawn_contact_clearance_m = spawn_contact_clearance_m
+        self.settle_max_steps = settle_max_steps
+        self.settle_stable_steps = settle_stable_steps
+        self.spawn_attempts = spawn_attempts
         self._rng = np.random.default_rng(seed)
         self._temporary_directory = tempfile.TemporaryDirectory(prefix="prana_recovery_")
         self._model: mujoco.MjModel | None = None
@@ -131,27 +139,99 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         if seed is not None or self._model is None or self._episodes_on_terrain >= self.terrain_episodes:
             self._build_terrain_model()
 
-        assert self._terrain is not None
-        self._scenario = ScenarioSampler(self._terrain, int(self._rng.integers(0, np.iinfo(np.int32).max))).sample()
-        mujoco.mj_resetData(self.model, self.data)
-        spawn_x, spawn_y = self._scenario.spawn_xy_m
-        qpos = self.data.qpos
-        qpos[self._free_joint_qposadr : self._free_joint_qposadr + 3] = (
-            spawn_x,
-            spawn_y,
-            self._terrain.height_at(spawn_x, spawn_y) + self.spawn_clearance_m,
-        )
-        half_yaw = self._scenario.spawn_yaw_rad * 0.5
-        qpos[self._free_joint_qposadr + 3 : self._free_joint_qposadr + 7] = (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
-        mujoco.mj_forward(self.model, self.data)
-        apply_twist(self.data, self._steering_ids, self._drive_ids, np.zeros(3))
-        for _ in range(100):
-            mujoco.mj_step(self.model, self.data)
+        settled = False
+        for _ in range(3):
+            assert self._terrain is not None
+            for _ in range(self.spawn_attempts):
+                self._scenario = ScenarioSampler(
+                    self._terrain, int(self._rng.integers(0, np.iinfo(np.int32).max))
+                ).sample()
+                if self._place_and_settle():
+                    settled = True
+                    break
+            if settled:
+                break
+            # This terrain did not offer a stable sampled scenario. Build a
+            # new one rather than presenting PPO with a falling rover.
+            self._build_terrain_model()
+
+        if not settled:
+            raise RuntimeError("Could not find a stable rover spawn after terrain and scenario retries.")
 
         self._step_count = 0
         self._episodes_on_terrain += 1
         self._previous_distance_m = self._distance_to_target()
         return self._observation(), self._info()
+
+    def _place_and_settle(self) -> bool:
+        """Place wheels just above terrain, then wait until passive physics is calm."""
+        assert self._terrain is not None
+        assert self._scenario is not None
+        mujoco.mj_resetData(self.model, self.data)
+        spawn_x, spawn_y = self._scenario.spawn_xy_m
+        rotation = self._terrain_aligned_rotation(spawn_x, spawn_y, self._scenario.spawn_yaw_rad)
+        qpos = self.data.qpos
+        qpos[self._free_joint_qposadr : self._free_joint_qposadr + 3] = (spawn_x, spawn_y, 0.0)
+        quaternion = np.empty(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(quaternion, rotation.ravel())
+        qpos[self._free_joint_qposadr + 3 : self._free_joint_qposadr + 7] = quaternion
+        mujoco.mj_forward(self.model, self.data)
+
+        # At root Z=0 these are each wheel's world positions relative to the
+        # terrain. Raise the rover only enough for its lowest wheel to clear.
+        root_z = max(
+            self._terrain.height_at(*self.data.body(f"wheel_{wheel}").xpos[:2])
+            - self.data.body(f"wheel_{wheel}").xpos[2]
+            + WHEEL_RADIUS_M
+            + self.spawn_contact_clearance_m
+            for wheel in WHEEL_NAMES
+        )
+        qpos[self._free_joint_qposadr + 2] = root_z
+        mujoco.mj_forward(self.model, self.data)
+        apply_twist(self.data, self._steering_ids, self._drive_ids, np.zeros(3))
+
+        stable_steps = 0
+        for _ in range(self.settle_max_steps):
+            mujoco.mj_step(self.model, self.data)
+            if self._is_settled():
+                stable_steps += 1
+                if stable_steps >= self.settle_stable_steps:
+                    return True
+            else:
+                stable_steps = 0
+        return False
+
+    def _terrain_aligned_rotation(self, x_m: float, y_m: float, yaw_rad: float) -> np.ndarray:
+        """Return a body rotation with its Z axis normal to a wheel-fit plane."""
+        assert self._terrain is not None
+        yaw_rotation = np.array(
+            [[math.cos(yaw_rad), -math.sin(yaw_rad)], [math.sin(yaw_rad), math.cos(yaw_rad)]],
+            dtype=np.float64,
+        )
+        wheel_xy = np.asarray([x_m, y_m]) + WHEEL_POSITIONS_M @ yaw_rotation.T
+        heights = np.array([self._terrain.height_at(*point) for point in wheel_xy])
+        plane, *_ = np.linalg.lstsq(
+            np.column_stack((wheel_xy, np.ones(len(wheel_xy)))), heights, rcond=None
+        )
+        normal = np.array([-plane[0], -plane[1], 1.0], dtype=np.float64)
+        normal /= np.linalg.norm(normal)
+        heading = np.array([math.cos(yaw_rad), math.sin(yaw_rad), 0.0], dtype=np.float64)
+        forward = heading - normal * np.dot(heading, normal)
+        forward /= np.linalg.norm(forward)
+        left = np.cross(normal, forward)
+        return np.column_stack((forward, left, normal))
+
+    def _is_settled(self) -> bool:
+        linear_velocity = self.data.qvel[self._free_joint_dofadr : self._free_joint_dofadr + 3]
+        angular_velocity = self.data.qvel[self._free_joint_dofadr + 3 : self._free_joint_dofadr + 6]
+        roll, pitch = self._roll_pitch()
+        return (
+            np.linalg.norm(linear_velocity) < 0.05
+            and np.linalg.norm(angular_velocity) < 0.12
+            and abs(roll) < 0.85
+            and abs(pitch) < 0.85
+            and self._body_contact_count() == 0
+        )
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
@@ -199,7 +279,7 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         for index in range(self.data.ncon):
             contact = self.data.contact[index]
             names = (self.model.geom(contact.geom1).name, self.model.geom(contact.geom2).name)
-            count += any(name.startswith("collision_") for name in names)
+            count += any(name is not None and name.startswith("collision_") for name in names)
         return count
 
     def _observation(self) -> np.ndarray:

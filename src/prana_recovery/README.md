@@ -29,10 +29,12 @@ Use `--terrain-height-range` to make the terrain steeper. For example, start
 with `1.0` metres or `1.2` metres; use the same value for training and
 evaluation.
 
-The rover initially spawns `1.15` metres above the sampled terrain and settles
-under physics before the episode starts. Adjust `--spawn-clearance` if a rover
-starts intersecting a particularly tall terrain feature; use the same value
-when evaluating a saved policy.
+Before an episode starts, the environment samples terrain below the four wheel
+positions, aligns rover roll and pitch to the fitted support plane, and places
+the wheels `1.5 cm` above the terrain. It then applies zero control until the
+rover is stable. Failed placements are retried internally and never become PPO
+episodes. Adjust `--spawn-contact-clearance` only if the wheel geometry needs
+more or less initial clearance; use the same value when evaluating a policy.
 
 The terrain generator and sampler have no PPO dependency. A later focused
 scenario family can be added beside `ScenarioSampler`, then selected by a new
