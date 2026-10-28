@@ -196,11 +196,36 @@ def apply_twist(data: mujoco.MjData, steering_ids: list[int], drive_ids: list[in
         data.ctrl[actuator_id] = target
 
 
+def show_collision_proxies(model: mujoco.MjModel) -> None:
+    """Make the normally invisible primitive collision proxies visible."""
+    for geom_id in range(model.ngeom):
+        name = model.geom(geom_id).name
+        if name is not None and name.startswith("collision_"):
+            model.geom_rgba[geom_id] = (0.1, 1.0, 0.1, 0.35)
+
+
+def make_visual_meshes_transparent(model: mujoco.MjModel) -> None:
+    """Fade rover STL meshes so collision overlays remain easy to inspect."""
+    for geom_id in range(model.ngeom):
+        if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH:
+            model.geom_rgba[geom_id, 3] = 0.12
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--linear-speed", type=float, default=0.8, help="Translation command speed in m/s (default: 0.8)")
     parser.add_argument("--yaw-speed", type=float, default=0.9, help="Diagonal-command yaw rate in rad/s (default: 0.9)")
     parser.add_argument("--no-viewer", action="store_true", help="Load and validate the model without opening interactive teleop")
+    parser.add_argument(
+        "--show-collision-proxies",
+        action="store_true",
+        help="Draw invisible body collision boxes as translucent green overlays",
+    )
+    parser.add_argument(
+        "--transparent-visual-meshes",
+        action="store_true",
+        help="Fade rover visual meshes so collision geometry is easier to inspect",
+    )
     return parser.parse_args()
 
 
@@ -211,6 +236,10 @@ def main() -> None:
     data = mujoco.MjData(model)
     steering_ids, drive_ids = actuator_ids(model)
     apply_twist(data, steering_ids, drive_ids, np.zeros(3))
+    if args.show_collision_proxies:
+        show_collision_proxies(model)
+    if args.transparent_visual_meshes:
+        make_visual_meshes_transparent(model)
 
     if args.no_viewer:
         for _ in range(50):
@@ -226,6 +255,8 @@ def main() -> None:
         "  J       left/crab (uppercase)\n"
         "  m , .   reverse-right, reverse, reverse-left\n"
         "  q       quit\n"
+        f"  collision proxies: {'visible (green)' if args.show_collision_proxies else 'hidden'}\n"
+        f"  visual meshes: {'transparent' if args.transparent_visual_meshes else 'normal'}\n"
         "Keep this terminal focused to send commands.\n"
     )
     try:
