@@ -56,6 +56,7 @@ def main() -> None:
     try:
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import SubprocVecEnv
+        from prana_recovery.policy import RoverTerrainExtractor
     except ImportError as error:
         raise SystemExit(
             "Stable-Baselines3 is required for training. Install the project requirements with "
@@ -72,7 +73,7 @@ def main() -> None:
         [make_env(args.seed + index, terrain_config, args.spawn_contact_clearance) for index in range(args.num_envs)]
     )
     model = PPO(
-        "MlpPolicy",
+        "MultiInputPolicy",
         environment,
         verbose=1,
         seed=args.seed,
@@ -80,6 +81,7 @@ def main() -> None:
         tensorboard_log=str(args.output / "tensorboard"),
         n_steps=1024,
         batch_size=256,
+        policy_kwargs={"features_extractor_class": RoverTerrainExtractor},
     )
     callback = None
     if args.render:

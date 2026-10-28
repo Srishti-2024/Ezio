@@ -21,8 +21,17 @@ can be replayed.
 
 The existing 4WIS controller converts that action to the four steering and four
 wheel commands. Its observation contains the body-frame egress target, base
-linear and angular velocity, roll/pitch, steering state, wheel speeds, and 16
-short-range MuJoCo ray distances.
+linear and angular velocity, roll/pitch, steering state, wheel speeds, and a
+front-facing simulated ZED-like depth view.
+
+The depth view uses `65°` horizontal FOV, a `4 m` range, and 48×30 ray samples.
+Each ray produces a real MuJoCo surface intersection, together forming a local
+3-D point cloud. The environment rasterises it into a 32×32 rover-frame
+elevation map plus an observed/unobserved mask. PPO uses `MultiInputPolicy`:
+a small CNN processes that terrain map, an MLP processes the rover state, then
+their features are fused before producing the 4WIS velocity command. This
+replaces the previous 16 omnidirectional horizontal rays, so old MLP policies
+cannot be evaluated with this environment and a new policy must be trained.
 
 Terrain relief defaults to `0.65` metres over the 16×16 metre heightfield.
 Use `--terrain-height-range` to make the terrain steeper. For example, start

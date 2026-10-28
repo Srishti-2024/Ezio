@@ -28,7 +28,7 @@ from prana_mujoco_teleop import WHEEL_NAMES, WHEEL_POSITIONS_M, WHEEL_RADIUS_M, 
 import mujoco_sim_mark2_v2 as rover_sim  # noqa: E402
 
 
-class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
+class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     """Recover a Prana rover from difficult positions on seeded heightfields.
 
     Actions are normalized ``[vx, vy, wz]`` body commands.  The environment
@@ -37,6 +37,19 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
     """
 
     metadata = {"render_modes": ["rgb_array"]}
+
+    # This is a deliberately downsampled ZED-like depth view.  The raw ray
+    # intersections form a 3-D point cloud which is rasterised below into a
+    # compact local elevation map for PPO.
+    CAMERA_HORIZONTAL_FOV_RAD = math.radians(65.0)
+    CAMERA_WIDTH = 48
+    CAMERA_HEIGHT = 30
+    CAMERA_RANGE_M = 4.0
+    CAMERA_OFFSET_BODY_M = np.array([0.45, 0.0, 0.45], dtype=np.float64)
+    TERRAIN_MAP_CELLS = 32
+    TERRAIN_MAP_FORWARD_M = 4.0
+    TERRAIN_MAP_HALF_WIDTH_M = 2.0
+    TERRAIN_MAP_HEIGHT_SCALE_M = 1.5
 
     def __init__(
         self,
@@ -78,10 +91,21 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         self._free_joint_dofadr = 0
         self._substeps = 1
         self._renderer: mujoco.Renderer | None = None
+        self._camera_directions_body = self._make_camera_ray_directions()
 
-        # target XY (2), base linear and angular velocity (6), pitch and roll
-        # (2), steering joints (4), wheel velocities (4), 16 ray distances.
-        self.observation_space = spaces.Box(low=-100.0, high=100.0, shape=(34,), dtype=np.float32)
+        # ``terrain`` is [normalized elevation, observed mask] in rover body
+        # coordinates. ``state`` remains the non-visual proprioceptive input.
+        self.observation_space = spaces.Dict(
+            {
+                "terrain": spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=(2, self.TERRAIN_MAP_CELLS, self.TERRAIN_MAP_CELLS),
+                    dtype=np.float32,
+                ),
+                "state": spaces.Box(low=-100.0, high=100.0, shape=(18,), dtype=np.float32),
+            }
+        )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
 
     @property
@@ -130,7 +154,9 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         self._substeps = max(1, round(self.control_dt_s / self._model.opt.timestep))
         self._episodes_on_terrain = 0
 
-    def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
+    def reset(
+        self, *, seed: int | None = None, options: dict | None = None
+    ) -> tuple[dict[str, np.ndarray], dict]:
         super().reset(seed=seed)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
@@ -233,7 +259,7 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
             and self._body_contact_count() == 0
         )
 
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
+    def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         twist = action * np.array([0.8, 0.8, 0.9], dtype=np.float64)
         apply_twist(self.data, self._steering_ids, self._drive_ids, twist)
@@ -282,7 +308,14 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
             count += any(name is not None and name.startswith("collision_") for name in names)
         return count
 
-    def _observation(self) -> np.ndarray:
+    def _observation(self) -> dict[str, np.ndarray]:
+        """Return a ZED-like local terrain view and normal rover state.
+
+        The terrain view is derived from actual MuJoCo 3-D ray intersections,
+        not direct access to the procedural heightfield.  Those intersections
+        are the simulated front-camera point cloud; rasterising them produces
+        a fixed-size input suited to a CNN.
+        """
         assert self._scenario is not None
         rotation = self._body_rotation()
         position = self.data.body("prana_mark2_v2").xpos
@@ -296,22 +329,93 @@ class PranaRecoveryEnv(gym.Env[np.ndarray, np.ndarray]):
         roll, pitch = self._roll_pitch()
         steering = np.array([self.data.qpos[self.model.joint(name).qposadr[0]] for name in ("bracker_lf_joint", "bracket_rf_joint", "bracket_lb_joint", "bracket_rb_joint")])
         wheel_velocity = np.array([self.data.qvel[self.model.joint(name).dofadr[0]] for name in ("wheel_fl_joint", "wheel_fr_joint", "wheel_lb_joint", "wheel_rb_joint")])
-        rays = self._lidar_distances(rotation, position)
-        return np.concatenate((target_delta_body[:2], velocity, angular_velocity, [roll, pitch], steering, wheel_velocity, rays)).astype(np.float32)
+        state = np.concatenate(
+            (target_delta_body[:2], velocity, angular_velocity, [roll, pitch], steering, wheel_velocity)
+        ).astype(np.float32)
+        return {"terrain": self._camera_elevation_map(rotation, position), "state": state}
 
-    def _lidar_distances(self, rotation: np.ndarray, position: np.ndarray) -> np.ndarray:
-        distances = np.empty(16, dtype=np.float64)
-        origin = position + np.array([0.0, 0.0, 0.20])
+    def _make_camera_ray_directions(self) -> np.ndarray:
+        """Create normalized body-frame rays for a 65 degree front camera."""
+        horizontal = np.linspace(
+            -self.CAMERA_HORIZONTAL_FOV_RAD / 2.0,
+            self.CAMERA_HORIZONTAL_FOV_RAD / 2.0,
+            self.CAMERA_WIDTH,
+        )
+        # ZED's camera is mounted above the chassis. Aim its centre slightly
+        # downward so the finite depth range covers terrain ahead of the rover.
+        vertical = np.linspace(math.radians(-48.0), math.radians(-4.0), self.CAMERA_HEIGHT)
+        yaw, pitch = np.meshgrid(horizontal, vertical)
+        directions = np.stack(
+            (
+                np.cos(pitch) * np.cos(yaw),
+                np.cos(pitch) * np.sin(yaw),
+                np.sin(pitch),
+            ),
+            axis=-1,
+        ).reshape(-1, 3)
+        return directions.astype(np.float64)
+
+    def _front_point_cloud_body(self, rotation: np.ndarray, position: np.ndarray) -> np.ndarray:
+        """Return visible front-camera surface points in rover body coordinates."""
+        directions_world = self._camera_directions_body @ rotation.T
+        origin_world = position + rotation @ self.CAMERA_OFFSET_BODY_M
         geomgroup = np.ones(6, dtype=np.uint8)
         rover_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "prana_mark2_v2")
-        hit_geom_id = np.empty(1, dtype=np.int32)
-        for index, angle in enumerate(np.linspace(-np.pi, np.pi, len(distances), endpoint=False)):
-            direction = rotation @ np.array([math.cos(angle), math.sin(angle), 0.0])
-            distance = mujoco.mj_ray(
-                self.model, self.data, origin, direction, geomgroup, True, rover_body_id, hit_geom_id
-            )
-            distances[index] = min(distance, 4.0) if distance >= 0.0 else 4.0
-        return distances / 4.0
+        distances = np.empty(len(directions_world), dtype=np.float64)
+        hit_geom_ids = np.empty(len(directions_world), dtype=np.int32)
+        mujoco.mj_multiRay(
+            self.model,
+            self.data,
+            origin_world,
+            directions_world.ravel(),
+            geomgroup,
+            True,
+            rover_body_id,
+            hit_geom_ids,
+            distances,
+            None,
+            len(directions_world),
+            self.CAMERA_RANGE_M,
+        )
+        valid = (distances >= 0.0) & (distances <= self.CAMERA_RANGE_M)
+        points_world = origin_world + directions_world[valid] * distances[valid, None]
+        return (points_world - position) @ rotation
+
+    def _camera_elevation_map(self, rotation: np.ndarray, position: np.ndarray) -> np.ndarray:
+        """Rasterise the front-camera point cloud as elevation and visibility."""
+        points_body = self._front_point_cloud_body(rotation, position)
+        cells = self.TERRAIN_MAP_CELLS
+        # Start at -inf so ``maximum.at`` also preserves terrain below the
+        # rover. A zero-filled map would erase all negative elevations.
+        elevation = np.full((cells, cells), -np.inf, dtype=np.float32)
+        observed = np.full((cells, cells), -1.0, dtype=np.float32)
+        if len(points_body) == 0:
+            return np.stack((np.zeros_like(elevation), observed))
+
+        forward = points_body[:, 0]
+        lateral = points_body[:, 1]
+        valid = (
+            (forward >= 0.0)
+            & (forward < self.TERRAIN_MAP_FORWARD_M)
+            & (np.abs(lateral) < self.TERRAIN_MAP_HALF_WIDTH_M)
+        )
+        if not np.any(valid):
+            return np.stack((np.zeros_like(elevation), observed))
+
+        forward = forward[valid]
+        lateral = lateral[valid]
+        point_heights = points_body[valid, 2] / self.TERRAIN_MAP_HEIGHT_SCALE_M
+        rows = np.minimum((forward / self.TERRAIN_MAP_FORWARD_M * cells).astype(np.int32), cells - 1)
+        columns = np.minimum(
+            ((lateral + self.TERRAIN_MAP_HALF_WIDTH_M) / (2.0 * self.TERRAIN_MAP_HALF_WIDTH_M) * cells).astype(np.int32),
+            cells - 1,
+        )
+        # Multiple depth pixels may land in one grid cell.  The highest hit is
+        # safest for a rover: it preserves the visible top of a ledge or rock.
+        np.maximum.at(elevation, (rows, columns), point_heights)
+        observed[rows, columns] = 1.0
+        elevation[observed < 0.0] = 0.0
+        return np.stack((np.clip(elevation, -1.0, 1.0), observed))
 
     def _info(self, *, success: bool = False, tipped: bool = False) -> dict:
         assert self._scenario is not None
