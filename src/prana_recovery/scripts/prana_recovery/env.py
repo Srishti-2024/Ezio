@@ -24,16 +24,17 @@ DESCRIPTION_SCRIPTS = SOURCE_ROOT / "prana_description" / "scripts"
 
 sys.path.insert(0, str(DRIVE_SCRIPTS))
 sys.path.insert(0, str(DESCRIPTION_SCRIPTS))
-from prana_mujoco_teleop import WHEEL_NAMES, WHEEL_POSITIONS_M, WHEEL_RADIUS_M, actuator_ids, apply_twist  # noqa: E402
+from prana_mujoco_teleop import WHEEL_NAMES, WHEEL_POSITIONS_M, WHEEL_RADIUS_M, actuator_ids  # noqa: E402
 import mujoco_sim_mark2_v2 as rover_sim  # noqa: E402
 
 
 class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     """Recover a Prana rover from difficult positions on seeded heightfields.
 
-    Actions are normalized ``[vx, vy, wz]`` body commands.  The environment
-    routes them through the same 4-wheel independent-steering controller used
-    by the interactive viewer.
+    Actions are normalized direct wheel commands in this fixed order:
+    ``[drive_fl, drive_fr, drive_lb, drive_rb, steer_fl, steer_fr, steer_lb,
+    steer_rb]``.  The policy controls each drive and steering actuator itself;
+    it does not receive the base-twist kinematic controller used by teleop.
     """
 
     metadata = {"render_modes": ["rgb_array"]}
@@ -50,6 +51,8 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     TERRAIN_MAP_FORWARD_M = 4.0
     TERRAIN_MAP_HALF_WIDTH_M = 2.0
     TERRAIN_MAP_HEIGHT_SCALE_M = 1.5
+    MAX_WHEEL_LINEAR_SPEED_M_S = 2.0
+    MAX_STEERING_ANGLE_RAD = math.pi / 2.0
 
     def __init__(
         self,
@@ -106,7 +109,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 "state": spaces.Box(low=-100.0, high=100.0, shape=(18,), dtype=np.float32),
             }
         )
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
 
     @property
     def model(self) -> mujoco.MjModel:
@@ -214,7 +217,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         )
         qpos[self._free_joint_qposadr + 2] = root_z
         mujoco.mj_forward(self.model, self.data)
-        apply_twist(self.data, self._steering_ids, self._drive_ids, np.zeros(3))
+        self._apply_direct_action(np.zeros(8, dtype=np.float64))
 
         stable_steps = 0
         for _ in range(self.settle_max_steps):
@@ -261,8 +264,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
 
     def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
-        twist = action * np.array([0.8, 0.8, 0.9], dtype=np.float64)
-        apply_twist(self.data, self._steering_ids, self._drive_ids, twist)
+        self._apply_direct_action(action)
         for _ in range(self._substeps):
             mujoco.mj_step(self.model, self.data)
 
@@ -277,13 +279,24 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         truncated = self._step_count >= self.max_episode_steps
 
         body_contacts = self._body_contact_count()
-        energy = float(np.square(action).sum())
+        # Use mean energy so this term has the same maximum scale as before
+        # the action space expanded from three base commands to eight motors.
+        energy = float(np.square(action).mean())
         reward = 8.0 * progress_m - 0.01 - 0.015 * energy - 0.01 * body_contacts
         if success:
             reward += 15.0
         if tipped:
             reward -= 10.0
         return self._observation(), float(reward), terminated, truncated, self._info(success=success, tipped=tipped)
+
+    def _apply_direct_action(self, action: np.ndarray) -> None:
+        """Map normalized direct motor commands to MuJoCo actuator targets."""
+        drive_linear_speed = action[:4] * self.MAX_WHEEL_LINEAR_SPEED_M_S
+        steering_target = action[4:] * self.MAX_STEERING_ANGLE_RAD
+        for actuator_id, target in zip(self._drive_ids, drive_linear_speed / WHEEL_RADIUS_M, strict=True):
+            self.data.ctrl[actuator_id] = target
+        for actuator_id, target in zip(self._steering_ids, steering_target, strict=True):
+            self.data.ctrl[actuator_id] = target
 
     def _body_rotation(self) -> np.ndarray:
         return self.data.body("prana_mark2_v2").xmat.reshape(3, 3).copy()

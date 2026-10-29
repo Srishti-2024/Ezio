@@ -13,14 +13,18 @@ then chooses a nearby lower-difficulty egress target. Every terrain seed and
 scenario seed is retained in the environment `info` dictionary, so an episode
 can be replayed.
 
-`env.py` is the Gymnasium boundary. It exposes a normalized body action:
+`env.py` is the Gymnasium boundary. It exposes eight normalized direct motor
+commands in this fixed order:
 
 ```text
-[vx, vy, wz] in [-1, 1]^3
+[drive_FL, drive_FR, drive_LB, drive_RB,
+ steer_FL, steer_FR, steer_LB, steer_RB] in [-1, 1]^8
 ```
 
-The existing 4WIS controller converts that action to the four steering and four
-wheel commands. Its observation contains the body-frame egress target, base
+Drive values map to ±2 m/s wheel speed and steering values map to ±90° target
+angle. The recovery policy now controls each actuator directly; the separate
+teleop package still uses its base-twist 4WIS controller. Its observation
+contains the body-frame egress target, base
 linear and angular velocity, roll/pitch, steering state, wheel speeds, and a
 front-facing simulated ZED-like depth view.
 
