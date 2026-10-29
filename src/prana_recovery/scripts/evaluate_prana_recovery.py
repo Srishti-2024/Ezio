@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--history-frames", type=int, default=4, help="Must match training (default: 4)")
     parser.add_argument("--precheck-steps", type=int, default=15, help="Must match training (default: 15)")
-    parser.add_argument("--precheck-translation", type=float, default=0.20, help="Must match training (default: 0.20)")
+    parser.add_argument("--precheck-translation", type=float, default=0.30, help="Must match training (default: 0.30)")
     parser.add_argument("--mobility-window-steps", type=int, default=20, help="Must match training (default: 20)")
     parser.add_argument("--mobility-displacement", type=float, default=0.50, help="Must match training (default: 0.50)")
     parser.add_argument("--mobility-path", type=float, default=0.60, help="Must match training (default: 0.60)")

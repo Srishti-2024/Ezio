@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-every", type=int, default=25, help="Render every N vector-environment steps")
     parser.add_argument("--history-frames", type=int, default=4, help="Past camera/state frames per observation")
     parser.add_argument("--precheck-steps", type=int, default=15, help="Control steps in each initial mobility probe")
-    parser.add_argument("--precheck-translation", type=float, default=0.20, help="Metres of probe movement that rejects a spawn")
+    parser.add_argument("--precheck-translation", type=float, default=0.30, help="Metres of probe movement that rejects a spawn")
     parser.add_argument("--mobility-window-steps", type=int, default=20, help="Consecutive control steps required for recovery")
     parser.add_argument("--mobility-displacement", type=float, default=0.50, help="Net metres required inside recovery window")
     parser.add_argument("--mobility-path", type=float, default=0.60, help="Path metres required inside recovery window")

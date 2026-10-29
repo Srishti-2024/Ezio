@@ -75,7 +75,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         spawn_attempts: int = 10,
         history_frames: int = 4,
         precheck_control_steps: int = 15,
-        precheck_translation_m: float = 0.20,
+        precheck_translation_m: float = 0.30,
         mobility_window_steps: int = 20,
         mobility_displacement_m: float = 0.50,
         mobility_path_m: float = 0.60,
@@ -224,7 +224,10 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             self._build_terrain_model()
 
         if not accepted:
-            raise RuntimeError("Could not find a stable, stuck rover spawn after terrain and scenario retries.")
+            raise RuntimeError(
+                "Could not find a stable, stuck rover spawn after terrain and scenario retries. "
+                "Reduce terrain height range, increase --precheck-translation, or relax the scenario sampler."
+            )
 
         self._step_count = 0
         self._episodes_on_terrain += 1

@@ -54,7 +54,7 @@ episodes. Adjust `--spawn-contact-clearance` only if the wheel geometry needs
 more or less initial clearance; use the same value when evaluating a policy.
 
 After settling, each candidate receives three short, scripted probes: forward,
-sideways/crab, and yaw. A candidate that translates at least `0.20 m` during
+sideways/crab, and yaw. A candidate that translates at least `0.30 m` during
 any probe is already mobile, so it is discarded internally before PPO sees it.
 Yaw alone does not reject a candidate. For a genuinely stuck candidate, the
 exact settled state is restored before PPO begins. Recovery succeeds only after
