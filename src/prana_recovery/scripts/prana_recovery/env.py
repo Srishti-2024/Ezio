@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sys
 import tempfile
+from collections import deque
 from pathlib import Path
 
 import gymnasium as gym
@@ -24,7 +25,13 @@ DESCRIPTION_SCRIPTS = SOURCE_ROOT / "prana_description" / "scripts"
 
 sys.path.insert(0, str(DRIVE_SCRIPTS))
 sys.path.insert(0, str(DESCRIPTION_SCRIPTS))
-from prana_mujoco_teleop import WHEEL_NAMES, WHEEL_POSITIONS_M, WHEEL_RADIUS_M, actuator_ids  # noqa: E402
+from prana_mujoco_teleop import (  # noqa: E402
+    WHEEL_NAMES,
+    WHEEL_POSITIONS_M,
+    WHEEL_RADIUS_M,
+    actuator_ids,
+    body_twist_to_wheels,
+)
 import mujoco_sim_mark2_v2 as rover_sim  # noqa: E402
 
 
@@ -53,6 +60,8 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     TERRAIN_MAP_HEIGHT_SCALE_M = 1.5
     MAX_WHEEL_LINEAR_SPEED_M_S = 2.0
     MAX_STEERING_ANGLE_RAD = math.pi / 2.0
+    PROPRIOCEPTIVE_STATE_SIZE = 16
+    ACTION_SIZE = 8
 
     def __init__(
         self,
@@ -64,6 +73,12 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         settle_max_steps: int = 750,
         settle_stable_steps: int = 50,
         spawn_attempts: int = 10,
+        history_frames: int = 4,
+        precheck_control_steps: int = 15,
+        precheck_translation_m: float = 0.20,
+        mobility_window_steps: int = 20,
+        mobility_displacement_m: float = 0.50,
+        mobility_path_m: float = 0.60,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -75,10 +90,20 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             raise ValueError("spawn_contact_clearance_m must not be negative.")
         if settle_max_steps < 1 or settle_stable_steps < 1 or spawn_attempts < 1:
             raise ValueError("settling and spawn attempt counts must be positive.")
+        if history_frames < 1 or precheck_control_steps < 1 or mobility_window_steps < 1:
+            raise ValueError("history, precheck, and mobility window counts must be positive.")
+        if precheck_translation_m <= 0.0 or mobility_displacement_m <= 0.0 or mobility_path_m <= 0.0:
+            raise ValueError("translation and mobility thresholds must be positive.")
         self.spawn_contact_clearance_m = spawn_contact_clearance_m
         self.settle_max_steps = settle_max_steps
         self.settle_stable_steps = settle_stable_steps
         self.spawn_attempts = spawn_attempts
+        self.history_frames = history_frames
+        self.precheck_control_steps = precheck_control_steps
+        self.precheck_translation_m = precheck_translation_m
+        self.mobility_window_steps = mobility_window_steps
+        self.mobility_displacement_m = mobility_displacement_m
+        self.mobility_path_m = mobility_path_m
         self._rng = np.random.default_rng(seed)
         self._temporary_directory = tempfile.TemporaryDirectory(prefix="prana_recovery_")
         self._model: mujoco.MjModel | None = None
@@ -89,27 +114,41 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._scenario: RecoveryScenario | None = None
         self._episodes_on_terrain = terrain_episodes
         self._step_count = 0
-        self._previous_distance_m = 0.0
+        self._previous_escape_distance_m = 0.0
+        self._episode_start_xy = np.zeros(2, dtype=np.float64)
+        self._last_action = np.zeros(self.ACTION_SIZE, dtype=np.float32)
+        self._terrain_history: deque[np.ndarray] = deque(maxlen=history_frames)
+        self._state_history: deque[np.ndarray] = deque(maxlen=history_frames)
+        self._mobility_positions: deque[np.ndarray] = deque(maxlen=mobility_window_steps + 1)
+        self._mobility_speeds: deque[float] = deque(maxlen=mobility_window_steps)
+        self._precheck_max_translation_m = 0.0
+        self._precheck_yaw_change_rad = 0.0
         self._free_joint_qposadr = 0
         self._free_joint_dofadr = 0
         self._substeps = 1
         self._renderer: mujoco.Renderer | None = None
         self._camera_directions_body = self._make_camera_ray_directions()
 
-        # ``terrain`` is [normalized elevation, observed mask] in rover body
-        # coordinates. ``state`` remains the non-visual proprioceptive input.
+        # Oldest to newest camera/proprioception frames are concatenated along
+        # their feature axes.  The numeric state also carries the last motor
+        # command, allowing the policy to notice that a command did not move it.
         self.observation_space = spaces.Dict(
             {
                 "terrain": spaces.Box(
                     low=-1.0,
                     high=1.0,
-                    shape=(2, self.TERRAIN_MAP_CELLS, self.TERRAIN_MAP_CELLS),
+                    shape=(2 * history_frames, self.TERRAIN_MAP_CELLS, self.TERRAIN_MAP_CELLS),
                     dtype=np.float32,
                 ),
-                "state": spaces.Box(low=-100.0, high=100.0, shape=(18,), dtype=np.float32),
+                "state": spaces.Box(
+                    low=-100.0,
+                    high=100.0,
+                    shape=((self.PROPRIOCEPTIVE_STATE_SIZE + self.ACTION_SIZE) * history_frames,),
+                    dtype=np.float32,
+                ),
             }
         )
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.ACTION_SIZE,), dtype=np.float32)
 
     @property
     def model(self) -> mujoco.MjModel:
@@ -168,29 +207,35 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         if seed is not None or self._model is None or self._episodes_on_terrain >= self.terrain_episodes:
             self._build_terrain_model()
 
-        settled = False
+        accepted = False
         for _ in range(3):
             assert self._terrain is not None
             for _ in range(self.spawn_attempts):
                 self._scenario = ScenarioSampler(
                     self._terrain, int(self._rng.integers(0, np.iinfo(np.int32).max))
                 ).sample()
-                if self._place_and_settle():
-                    settled = True
+                if self._place_and_settle() and self._precheck_is_stuck():
+                    accepted = True
                     break
-            if settled:
+            if accepted:
                 break
             # This terrain did not offer a stable sampled scenario. Build a
             # new one rather than presenting PPO with a falling rover.
             self._build_terrain_model()
 
-        if not settled:
-            raise RuntimeError("Could not find a stable rover spawn after terrain and scenario retries.")
+        if not accepted:
+            raise RuntimeError("Could not find a stable, stuck rover spawn after terrain and scenario retries.")
 
         self._step_count = 0
         self._episodes_on_terrain += 1
-        self._previous_distance_m = self._distance_to_target()
-        return self._observation(), self._info()
+        self._episode_start_xy = self._body_xy()
+        self._previous_escape_distance_m = 0.0
+        self._last_action.fill(0.0)
+        self._mobility_positions.clear()
+        self._mobility_positions.append(self._episode_start_xy.copy())
+        self._mobility_speeds.clear()
+        self._reset_observation_history()
+        return self._stacked_observation(), self._info()
 
     def _place_and_settle(self) -> bool:
         """Place wheels just above terrain, then wait until passive physics is calm."""
@@ -262,6 +307,70 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             and self._body_contact_count() == 0
         )
 
+    def _precheck_is_stuck(self) -> bool:
+        """Reject mobile starts, then restore genuinely stuck starts exactly.
+
+        This happens wholly inside ``reset()``.  A mobile candidate is not a
+        zero-reward PPO episode: it is discarded and another pose is sampled.
+        The yaw probe remains useful diagnostics, but rotation alone never
+        makes a rover count as mobile or recovered.
+        """
+        saved_qpos = self.data.qpos.copy()
+        saved_qvel = self.data.qvel.copy()
+        saved_act = self.data.act.copy()
+        saved_ctrl = self.data.ctrl.copy()
+        saved_time = self.data.time
+        self._precheck_max_translation_m = 0.0
+        self._precheck_yaw_change_rad = 0.0
+
+        probes = ((0.45, 0.0, 0.0), (0.0, 0.45, 0.0), (0.0, 0.0, 0.60))
+        for vx, vy, wz in probes:
+            # Each probe starts from the same settled state.  Otherwise a
+            # forward probe could make the following sideways probe easier.
+            self._restore_state(saved_qpos, saved_qvel, saved_act, saved_ctrl, saved_time)
+            start_xy = self._body_xy()
+            start_yaw = self._yaw()
+            probe_action = self._twist_probe_action(vx, vy, wz)
+            for _ in range(self.precheck_control_steps):
+                self._apply_direct_action(probe_action)
+                for _ in range(self._substeps):
+                    mujoco.mj_step(self.model, self.data)
+            self._precheck_max_translation_m = max(
+                self._precheck_max_translation_m, float(np.linalg.norm(self._body_xy() - start_xy))
+            )
+            self._precheck_yaw_change_rad = max(
+                self._precheck_yaw_change_rad, abs(self._wrapped_angle(self._yaw() - start_yaw))
+            )
+            roll, pitch = self._roll_pitch()
+            if abs(roll) > 0.85 or abs(pitch) > 0.85:
+                return False
+
+        is_stuck = self._precheck_max_translation_m < self.precheck_translation_m
+        if is_stuck:
+            self._restore_state(saved_qpos, saved_qvel, saved_act, saved_ctrl, saved_time)
+        return is_stuck
+
+    def _restore_state(
+        self,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+        act: np.ndarray,
+        ctrl: np.ndarray,
+        time_s: float,
+    ) -> None:
+        self.data.qpos[:] = qpos
+        self.data.qvel[:] = qvel
+        self.data.act[:] = act
+        self.data.ctrl[:] = ctrl
+        self.data.time = time_s
+        mujoco.mj_forward(self.model, self.data)
+
+    def _twist_probe_action(self, vx: float, vy: float, wz: float) -> np.ndarray:
+        steering, wheel_angular_velocity = body_twist_to_wheels(vx, vy, wz)
+        drive = wheel_angular_velocity * WHEEL_RADIUS_M / self.MAX_WHEEL_LINEAR_SPEED_M_S
+        steer = steering / self.MAX_STEERING_ANGLE_RAD
+        return np.clip(np.concatenate((drive, steer)), -1.0, 1.0)
+
     def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         self._apply_direct_action(action)
@@ -269,24 +378,40 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             mujoco.mj_step(self.model, self.data)
 
         self._step_count += 1
-        distance_m = self._distance_to_target()
-        progress_m = self._previous_distance_m - distance_m
-        self._previous_distance_m = distance_m
+        escape_distance_m = self._escape_distance()
+        progress_m = escape_distance_m - self._previous_escape_distance_m
+        self._previous_escape_distance_m = escape_distance_m
+        position = self._body_xy()
+        self._mobility_positions.append(position)
+        planar_speed_m_s = self._planar_speed_m_s()
+        self._mobility_speeds.append(planar_speed_m_s)
         roll_rad, pitch_rad = self._roll_pitch()
-        success = distance_m < 0.42 and abs(roll_rad) < 0.35 and abs(pitch_rad) < 0.35
         tipped = abs(roll_rad) > 0.85 or abs(pitch_rad) > 0.85
+        body_contacts = self._body_contact_count()
+        success = not tipped and body_contacts == 0 and self._has_sustained_mobility()
         terminated = success or tipped
         truncated = self._step_count >= self.max_episode_steps
 
-        body_contacts = self._body_contact_count()
-        # Use mean energy so this term has the same maximum scale as before
-        # the action space expanded from three base commands to eight motors.
+        # Target-free reward: get meaningfully away from the stuck start while
+        # preferring sustained, upright, smooth translation over thrashing.
         energy = float(np.square(action).mean())
-        reward = 8.0 * progress_m - 0.01 - 0.015 * energy - 0.01 * body_contacts
+        action_change = float(np.square(action - self._last_action).mean())
+        uprightness = max(0.0, 1.0 - (abs(roll_rad) + abs(pitch_rad)) / 0.70)
+        sustained_motion = min(planar_speed_m_s / 0.45, 1.0)
+        reward = (
+            8.0 * progress_m
+            + 0.03 * sustained_motion
+            + 0.02 * uprightness
+            - 0.01
+            - 0.015 * energy
+            - 0.010 * action_change
+            - 0.01 * body_contacts
+        )
         if success:
             reward += 15.0
         if tipped:
             reward -= 10.0
+        self._last_action = action.astype(np.float32)
         return self._observation(), float(reward), terminated, truncated, self._info(success=success, tipped=tipped)
 
     def _apply_direct_action(self, action: np.ndarray) -> None:
@@ -301,17 +426,45 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     def _body_rotation(self) -> np.ndarray:
         return self.data.body("prana_mark2_v2").xmat.reshape(3, 3).copy()
 
-    def _distance_to_target(self) -> float:
-        assert self._scenario is not None
-        position = self.data.body("prana_mark2_v2").xpos
-        target = np.asarray(self._scenario.egress_xy_m)
-        return float(np.linalg.norm(target - position[:2]))
+    def _body_xy(self) -> np.ndarray:
+        return self.data.body("prana_mark2_v2").xpos[:2].copy()
+
+    def _escape_distance(self) -> float:
+        return float(np.linalg.norm(self._body_xy() - self._episode_start_xy))
+
+    def _planar_speed_m_s(self) -> float:
+        velocity_world = self.data.qvel[self._free_joint_dofadr : self._free_joint_dofadr + 3]
+        return float(np.linalg.norm(velocity_world[:2]))
+
+    def _has_sustained_mobility(self) -> bool:
+        if len(self._mobility_positions) < self.mobility_window_steps + 1:
+            return False
+        positions = np.asarray(self._mobility_positions)
+        net_displacement = float(np.linalg.norm(positions[-1] - positions[0]))
+        path_length = float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
+        mean_speed = float(np.mean(self._mobility_speeds))
+        roll, pitch = self._roll_pitch()
+        return (
+            net_displacement >= self.mobility_displacement_m
+            and path_length >= self.mobility_path_m
+            and mean_speed >= 0.15
+            and abs(roll) < 0.35
+            and abs(pitch) < 0.35
+        )
 
     def _roll_pitch(self) -> tuple[float, float]:
         rotation = self._body_rotation()
         pitch = math.atan2(-rotation[2, 0], math.hypot(rotation[2, 1], rotation[2, 2]))
         roll = math.atan2(rotation[2, 1], rotation[2, 2])
         return roll, pitch
+
+    def _yaw(self) -> float:
+        rotation = self._body_rotation()
+        return math.atan2(rotation[1, 0], rotation[0, 0])
+
+    @staticmethod
+    def _wrapped_angle(angle_rad: float) -> float:
+        return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
 
     def _body_contact_count(self) -> int:
         count = 0
@@ -322,30 +475,47 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         return count
 
     def _observation(self) -> dict[str, np.ndarray]:
-        """Return a ZED-like local terrain view and normal rover state.
+        """Append and return a history of camera and proprioceptive frames.
 
         The terrain view is derived from actual MuJoCo 3-D ray intersections,
         not direct access to the procedural heightfield.  Those intersections
         are the simulated front-camera point cloud; rasterising them produces
         a fixed-size input suited to a CNN.
         """
-        assert self._scenario is not None
+        terrain, state = self._sensor_frame()
+        self._terrain_history.append(terrain)
+        self._state_history.append(state)
+        return self._stacked_observation()
+
+    def _reset_observation_history(self) -> None:
+        """Seed every history slot with the same settled initial observation."""
+        terrain, state = self._sensor_frame()
+        self._terrain_history.clear()
+        self._state_history.clear()
+        for _ in range(self.history_frames):
+            self._terrain_history.append(terrain.copy())
+            self._state_history.append(state.copy())
+
+    def _stacked_observation(self) -> dict[str, np.ndarray]:
+        return {
+            "terrain": np.concatenate(tuple(self._terrain_history), axis=0).astype(np.float32),
+            "state": np.concatenate(tuple(self._state_history), axis=0).astype(np.float32),
+        }
+
+    def _sensor_frame(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return one target-free camera/proprioception/action frame."""
         rotation = self._body_rotation()
         position = self.data.body("prana_mark2_v2").xpos
-        target_delta_body = rotation.T @ np.array([
-            self._scenario.egress_xy_m[0] - position[0],
-            self._scenario.egress_xy_m[1] - position[1],
-            0.0,
-        ])
         velocity = rotation.T @ self.data.qvel[self._free_joint_dofadr : self._free_joint_dofadr + 3]
         angular_velocity = rotation.T @ self.data.qvel[self._free_joint_dofadr + 3 : self._free_joint_dofadr + 6]
         roll, pitch = self._roll_pitch()
         steering = np.array([self.data.qpos[self.model.joint(name).qposadr[0]] for name in ("bracker_lf_joint", "bracket_rf_joint", "bracket_lb_joint", "bracket_rb_joint")])
         wheel_velocity = np.array([self.data.qvel[self.model.joint(name).dofadr[0]] for name in ("wheel_fl_joint", "wheel_fr_joint", "wheel_lb_joint", "wheel_rb_joint")])
-        state = np.concatenate(
-            (target_delta_body[:2], velocity, angular_velocity, [roll, pitch], steering, wheel_velocity)
+        proprioception = np.concatenate(
+            (velocity, angular_velocity, [roll, pitch], steering, wheel_velocity)
         ).astype(np.float32)
-        return {"terrain": self._camera_elevation_map(rotation, position), "state": state}
+        state = np.concatenate((proprioception, self._last_action)).astype(np.float32)
+        return self._camera_elevation_map(rotation, position), state
 
     def _make_camera_ray_directions(self) -> np.ndarray:
         """Create normalized body-frame rays for a 65 degree front camera."""
@@ -435,7 +605,9 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         return {
             "terrain_seed": self._scenario.terrain_seed,
             "difficulty": self._scenario.difficulty,
-            "distance_to_egress_m": self._distance_to_target(),
+            "displacement_from_start_m": self._escape_distance(),
+            "precheck_max_translation_m": self._precheck_max_translation_m,
+            "precheck_yaw_change_rad": self._precheck_yaw_change_rad,
             "success": success,
             "tipped": tipped,
         }

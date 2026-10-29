@@ -38,15 +38,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render", action="store_true", help="Show selected real PPO workers in one live grid window")
     parser.add_argument("--render-envs", type=int, default=4, help="Maximum workers to display with --render")
     parser.add_argument("--render-every", type=int, default=25, help="Render every N vector-environment steps")
+    parser.add_argument("--history-frames", type=int, default=4, help="Past camera/state frames per observation")
+    parser.add_argument("--precheck-steps", type=int, default=15, help="Control steps in each initial mobility probe")
+    parser.add_argument("--precheck-translation", type=float, default=0.20, help="Metres of probe movement that rejects a spawn")
+    parser.add_argument("--mobility-window-steps", type=int, default=20, help="Consecutive control steps required for recovery")
+    parser.add_argument("--mobility-displacement", type=float, default=0.50, help="Net metres required inside recovery window")
+    parser.add_argument("--mobility-path", type=float, default=0.60, help="Path metres required inside recovery window")
     return parser.parse_args()
 
 
-def make_env(seed: int, terrain_config: TerrainConfig, spawn_contact_clearance_m: float):
+def make_env(seed: int, terrain_config: TerrainConfig, spawn_contact_clearance_m: float, recovery_options: dict):
     def factory() -> PranaRecoveryEnv:
         return PranaRecoveryEnv(
             terrain_config=terrain_config,
             spawn_contact_clearance_m=spawn_contact_clearance_m,
             seed=seed,
+            **recovery_options,
         )
     return factory
 
@@ -68,9 +75,29 @@ def main() -> None:
         raise SystemExit("--render-envs and --render-every must both be positive.")
     if args.terrain_height_range <= 0.0 or args.spawn_contact_clearance < 0.0:
         raise SystemExit("--terrain-height-range must be positive and --spawn-contact-clearance cannot be negative.")
+    if (
+        args.history_frames < 1
+        or args.precheck_steps < 1
+        or args.mobility_window_steps < 1
+        or args.precheck_translation <= 0.0
+        or args.mobility_displacement <= 0.0
+        or args.mobility_path <= 0.0
+    ):
+        raise SystemExit("Recovery history, step counts, and distance thresholds must all be positive.")
     terrain_config = TerrainConfig(height_range_m=args.terrain_height_range)
+    recovery_options = {
+        "history_frames": args.history_frames,
+        "precheck_control_steps": args.precheck_steps,
+        "precheck_translation_m": args.precheck_translation,
+        "mobility_window_steps": args.mobility_window_steps,
+        "mobility_displacement_m": args.mobility_displacement,
+        "mobility_path_m": args.mobility_path,
+    }
     environment = SubprocVecEnv(
-        [make_env(args.seed + index, terrain_config, args.spawn_contact_clearance) for index in range(args.num_envs)]
+        [
+            make_env(args.seed + index, terrain_config, args.spawn_contact_clearance, recovery_options)
+            for index in range(args.num_envs)
+        ]
     )
     model = PPO(
         "MultiInputPolicy",

@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Update the live view every N evaluation steps (default: 1)",
     )
+    parser.add_argument("--history-frames", type=int, default=4, help="Must match training (default: 4)")
+    parser.add_argument("--precheck-steps", type=int, default=15, help="Must match training (default: 15)")
+    parser.add_argument("--precheck-translation", type=float, default=0.20, help="Must match training (default: 0.20)")
+    parser.add_argument("--mobility-window-steps", type=int, default=20, help="Must match training (default: 20)")
+    parser.add_argument("--mobility-displacement", type=float, default=0.50, help="Must match training (default: 0.50)")
+    parser.add_argument("--mobility-path", type=float, default=0.60, help="Must match training (default: 0.60)")
     return parser.parse_args()
 
 
@@ -91,9 +97,24 @@ def main() -> None:
         raise SystemExit("--render-every must be positive.")
     if args.terrain_height_range <= 0.0 or args.spawn_contact_clearance < 0.0:
         raise SystemExit("--terrain-height-range must be positive and --spawn-contact-clearance cannot be negative.")
+    if (
+        args.history_frames < 1
+        or args.precheck_steps < 1
+        or args.mobility_window_steps < 1
+        or args.precheck_translation <= 0.0
+        or args.mobility_displacement <= 0.0
+        or args.mobility_path <= 0.0
+    ):
+        raise SystemExit("Recovery history, step counts, and distance thresholds must all be positive.")
     environment = PranaRecoveryEnv(
         terrain_config=TerrainConfig(height_range_m=args.terrain_height_range),
         spawn_contact_clearance_m=args.spawn_contact_clearance,
+        history_frames=args.history_frames,
+        precheck_control_steps=args.precheck_steps,
+        precheck_translation_m=args.precheck_translation,
+        mobility_window_steps=args.mobility_window_steps,
+        mobility_displacement_m=args.mobility_displacement,
+        mobility_path_m=args.mobility_path,
         seed=args.seed,
     )
     policy = PPO.load(args.model)

@@ -17,7 +17,7 @@ class RoverTerrainExtractor(BaseFeaturesExtractor):
         assert terrain_shape is not None
 
         self.terrain_cnn = th.nn.Sequential(
-            th.nn.Conv2d(2, 16, kernel_size=5, stride=2),
+            th.nn.Conv2d(terrain_shape[0], 16, kernel_size=5, stride=2),
             th.nn.ReLU(),
             th.nn.Conv2d(16, 32, kernel_size=3, stride=2),
             th.nn.ReLU(),
