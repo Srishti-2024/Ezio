@@ -45,6 +45,9 @@ rover is stable. Failed placements are retried internally and never become PPO
 episodes. Adjust `--spawn-contact-clearance` only if the wheel geometry needs
 more or less initial clearance; use the same value when evaluating a policy.
 
+For inspection of one evaluated rover in MuJoCo's normal interactive free
+camera, use `evaluate_prana_recovery.py --mujoco-viewer --episodes 1`.
+
 The terrain generator and sampler have no PPO dependency. A later focused
 scenario family can be added beside `ScenarioSampler`, then selected by a new
 environment configuration without changing the controller, rewards, or PPO

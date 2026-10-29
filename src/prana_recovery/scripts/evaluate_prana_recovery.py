@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -35,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--render", action="store_true", help="Show the live MuJoCo evaluation episode")
     parser.add_argument(
+        "--mujoco-viewer",
+        action="store_true",
+        help="Open MuJoCo's interactive free-camera viewer during each evaluation episode",
+    )
+    parser.add_argument(
         "--render-envs",
         type=int,
         default=1,
@@ -49,6 +55,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def run_episode(
+    environment: PranaRecoveryEnv, policy, observation, viewer=None
+) -> tuple[float, dict]:
+    """Run one policy episode, optionally synchronising a native MuJoCo viewer."""
+    episode_return = 0.0
+    while True:
+        if viewer is not None and not viewer.is_running():
+            raise SystemExit("MuJoCo viewer was closed; stopping evaluation.")
+        action, _ = policy.predict(observation, deterministic=True)
+        started_at = time.monotonic()
+        observation, reward, terminated, truncated, info = environment.step(action)
+        episode_return += reward
+        if viewer is not None:
+            viewer.sync()
+            time.sleep(max(0.0, environment.control_dt_s - (time.monotonic() - started_at)))
+        if terminated or truncated:
+            return episode_return, info
+
+
 def main() -> None:
     args = parse_args()
     try:
@@ -58,6 +83,8 @@ def main() -> None:
 
     if args.episodes < 1:
         raise SystemExit("--episodes must be positive.")
+    if args.render and args.mujoco_viewer:
+        raise SystemExit("Choose either --render or --mujoco-viewer, not both.")
     if args.render_envs != 1:
         raise SystemExit("Evaluation runs one environment, so --render-envs must be 1.")
     if args.render_every < 1:
@@ -71,22 +98,33 @@ def main() -> None:
     )
     policy = PPO.load(args.model)
     viewer = EvaluationFrameViewer() if args.render else None
+    mujoco_viewer_module = None
+    if args.mujoco_viewer:
+        import mujoco.viewer
+
+        mujoco_viewer_module = mujoco.viewer
     successes = 0
     returns: list[float] = []
     try:
         for episode in range(args.episodes):
             observation, info = environment.reset(seed=args.seed + episode)
-            episode_return = 0.0
-            step = 0
-            while True:
-                action, _ = policy.predict(observation, deterministic=True)
-                observation, reward, terminated, truncated, info = environment.step(action)
-                episode_return += reward
-                step += 1
-                if viewer is not None and step % args.render_every == 0:
-                    viewer.update(environment.render(), episode=episode, step=step)
-                if terminated or truncated:
-                    break
+            if mujoco_viewer_module is not None:
+                # A seeded reset creates a new MuJoCo model/heightfield, so a
+                # native viewer is opened per episode to stay attached to it.
+                with mujoco_viewer_module.launch_passive(environment.model, environment.data) as native_viewer:
+                    episode_return, info = run_episode(environment, policy, observation, native_viewer)
+            else:
+                episode_return = 0.0
+                step = 0
+                while True:
+                    action, _ = policy.predict(observation, deterministic=True)
+                    observation, reward, terminated, truncated, info = environment.step(action)
+                    episode_return += reward
+                    step += 1
+                    if viewer is not None and step % args.render_every == 0:
+                        viewer.update(environment.render(), episode=episode, step=step)
+                    if terminated or truncated:
+                        break
             successes += int(info["success"])
             returns.append(episode_return)
             print(
