@@ -1,4 +1,8 @@
+# development information
 developmentdocs
+
+# trained policies, binary files and logs - will be later uploaded on hugging face
+runs
 
 # Python bytecode caches and compiled files
 __pycache__/

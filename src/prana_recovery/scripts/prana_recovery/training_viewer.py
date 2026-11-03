@@ -14,7 +14,7 @@ class TrainingMosaicCallback:
     showcase physics: every tile is a worker PPO is currently training on.
     """
 
-    def __new__(cls, *, every_steps: int, worker_count: int):
+    def __new__(cls, *, every_steps: int, worker_count: int, show_precheck: bool = False):
         try:
             import matplotlib.pyplot as plt
             from stable_baselines3.common.callbacks import BaseCallback
@@ -29,6 +29,7 @@ class TrainingMosaicCallback:
                 self._plt = plt
                 self._every_steps = every_steps
                 self._worker_indices = list(range(worker_count))
+                self._show_precheck = show_precheck
                 self._figure = None
                 self._axes = []
                 self._images = []
@@ -51,6 +52,11 @@ class TrainingMosaicCallback:
             def _on_step(self) -> bool:
                 if self.n_calls % self._every_steps:
                     return True
+                if self._show_precheck:
+                    probe_frames = self.training_env.env_method(
+                        "consume_precheck_frames", indices=self._worker_indices
+                    )
+                    self._replay_prechecks(probe_frames)
                 frames = self.training_env.env_method("render", indices=self._worker_indices)
                 for index, frame in enumerate(frames):
                     if index >= len(self._images):
@@ -62,6 +68,24 @@ class TrainingMosaicCallback:
                 self._figure.canvas.flush_events()
                 self._plt.pause(0.001)
                 return True
+
+            def _replay_prechecks(self, probe_frames) -> None:
+                """Replay accepted-start probes in the same worker mosaic."""
+                frame_count = max((len(worker_frames) for worker_frames in probe_frames), default=0)
+                for frame_index in range(frame_count):
+                    for worker_index, worker_frames in enumerate(probe_frames):
+                        if frame_index >= len(worker_frames):
+                            continue
+                        label, frame = worker_frames[frame_index]
+                        if worker_index >= len(self._images):
+                            self._images.append(self._axes[worker_index].imshow(frame))
+                        else:
+                            self._images[worker_index].set_data(frame)
+                        self._axes[worker_index].set_title(f"worker {worker_index}: {label}")
+                    assert self._figure is not None
+                    self._figure.canvas.draw_idle()
+                    self._figure.canvas.flush_events()
+                    self._plt.pause(0.08)
 
             def _on_training_end(self) -> None:
                 if self._figure is not None:
@@ -96,6 +120,18 @@ class EvaluationFrameViewer:
         self._figure.canvas.draw_idle()
         self._figure.canvas.flush_events()
         self._plt.pause(0.001)
+
+    def replay_precheck(self, frames, *, episode: int) -> None:
+        """Show the accepted start's recorded forward/crab/yaw probes."""
+        for label, frame in frames:
+            if self._image is None:
+                self._image = self._axis.imshow(frame)
+            else:
+                self._image.set_data(frame)
+            self._axis.set_title(f"Evaluation episode {episode}: {label}")
+            self._figure.canvas.draw_idle()
+            self._figure.canvas.flush_events()
+            self._plt.pause(0.12)
 
     def close(self) -> None:
         self._plt.ioff()

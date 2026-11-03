@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--render", action="store_true", help="Show the live MuJoCo evaluation episode")
     parser.add_argument(
+        "--show-precheck",
+        action="store_true",
+        help="Replay accepted forward/crab/yaw stuckness probes before PPO; requires --render",
+    )
+    parser.add_argument(
         "--mujoco-viewer",
         action="store_true",
         help="Open MuJoCo's interactive free-camera viewer during each evaluation episode",
@@ -53,7 +58,8 @@ def parse_args() -> argparse.Namespace:
         help="Update the live view every N evaluation steps (default: 1)",
     )
     parser.add_argument("--history-frames", type=int, default=4, help="Must match training (default: 4)")
-    parser.add_argument("--precheck-steps", type=int, default=15, help="Must match training (default: 15)")
+    parser.add_argument("--precheck-steering-steps", type=int, default=10, help="Must match training (default: 10)")
+    parser.add_argument("--precheck-steps", type=int, default=30, help="Must match training (default: 30)")
     parser.add_argument("--precheck-translation", type=float, default=0.30, help="Must match training (default: 0.30)")
     parser.add_argument("--mobility-window-steps", type=int, default=20, help="Must match training (default: 20)")
     parser.add_argument("--mobility-displacement", type=float, default=0.50, help="Must match training (default: 0.50)")
@@ -91,6 +97,8 @@ def main() -> None:
         raise SystemExit("--episodes must be positive.")
     if args.render and args.mujoco_viewer:
         raise SystemExit("Choose either --render or --mujoco-viewer, not both.")
+    if args.show_precheck and not args.render:
+        raise SystemExit("--show-precheck requires --render; native MuJoCo viewer attaches after reset.")
     if args.render_envs != 1:
         raise SystemExit("Evaluation runs one environment, so --render-envs must be 1.")
     if args.render_every < 1:
@@ -99,6 +107,7 @@ def main() -> None:
         raise SystemExit("--terrain-height-range must be positive and --spawn-contact-clearance cannot be negative.")
     if (
         args.history_frames < 1
+        or args.precheck_steering_steps < 1
         or args.precheck_steps < 1
         or args.mobility_window_steps < 1
         or args.precheck_translation <= 0.0
@@ -110,11 +119,13 @@ def main() -> None:
         terrain_config=TerrainConfig(height_range_m=args.terrain_height_range),
         spawn_contact_clearance_m=args.spawn_contact_clearance,
         history_frames=args.history_frames,
+        precheck_steering_steps=args.precheck_steering_steps,
         precheck_control_steps=args.precheck_steps,
         precheck_translation_m=args.precheck_translation,
         mobility_window_steps=args.mobility_window_steps,
         mobility_displacement_m=args.mobility_displacement,
         mobility_path_m=args.mobility_path,
+        record_precheck_frames=args.show_precheck,
         seed=args.seed,
     )
     policy = PPO.load(args.model)
@@ -129,6 +140,8 @@ def main() -> None:
     try:
         for episode in range(args.episodes):
             observation, info = environment.reset(seed=args.seed + episode)
+            if viewer is not None and args.show_precheck:
+                viewer.replay_precheck(environment.consume_precheck_frames(), episode=episode)
             if mujoco_viewer_module is not None:
                 # A seeded reset creates a new MuJoCo model/heightfield, so a
                 # native viewer is opened per episode to stay attached to it.

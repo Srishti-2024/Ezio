@@ -73,12 +73,15 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         settle_max_steps: int = 750,
         settle_stable_steps: int = 50,
         spawn_attempts: int = 10,
+        spawn_max_body_contacts: int = 8,
         history_frames: int = 4,
-        precheck_control_steps: int = 15,
+        precheck_steering_steps: int = 10,
+        precheck_control_steps: int = 30,
         precheck_translation_m: float = 0.30,
         mobility_window_steps: int = 20,
         mobility_displacement_m: float = 0.50,
         mobility_path_m: float = 0.60,
+        record_precheck_frames: bool = False,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -90,7 +93,14 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             raise ValueError("spawn_contact_clearance_m must not be negative.")
         if settle_max_steps < 1 or settle_stable_steps < 1 or spawn_attempts < 1:
             raise ValueError("settling and spawn attempt counts must be positive.")
-        if history_frames < 1 or precheck_control_steps < 1 or mobility_window_steps < 1:
+        if spawn_max_body_contacts < 0:
+            raise ValueError("spawn_max_body_contacts must not be negative.")
+        if (
+            history_frames < 1
+            or precheck_steering_steps < 1
+            or precheck_control_steps < 1
+            or mobility_window_steps < 1
+        ):
             raise ValueError("history, precheck, and mobility window counts must be positive.")
         if precheck_translation_m <= 0.0 or mobility_displacement_m <= 0.0 or mobility_path_m <= 0.0:
             raise ValueError("translation and mobility thresholds must be positive.")
@@ -98,12 +108,15 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self.settle_max_steps = settle_max_steps
         self.settle_stable_steps = settle_stable_steps
         self.spawn_attempts = spawn_attempts
+        self.spawn_max_body_contacts = spawn_max_body_contacts
         self.history_frames = history_frames
+        self.precheck_steering_steps = precheck_steering_steps
         self.precheck_control_steps = precheck_control_steps
         self.precheck_translation_m = precheck_translation_m
         self.mobility_window_steps = mobility_window_steps
         self.mobility_displacement_m = mobility_displacement_m
         self.mobility_path_m = mobility_path_m
+        self.record_precheck_frames = record_precheck_frames
         self._rng = np.random.default_rng(seed)
         self._temporary_directory = tempfile.TemporaryDirectory(prefix="prana_recovery_")
         self._model: mujoco.MjModel | None = None
@@ -123,6 +136,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._mobility_speeds: deque[float] = deque(maxlen=mobility_window_steps)
         self._precheck_max_translation_m = 0.0
         self._precheck_yaw_change_rad = 0.0
+        self._precheck_frames: list[tuple[str, np.ndarray]] = []
         self._free_joint_qposadr = 0
         self._free_joint_dofadr = 0
         self._substeps = 1
@@ -208,15 +222,21 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             self._build_terrain_model()
 
         accepted = False
+        unstable_candidates = 0
+        mobile_or_tipped_candidates = 0
         for _ in range(3):
             assert self._terrain is not None
             for _ in range(self.spawn_attempts):
                 self._scenario = ScenarioSampler(
                     self._terrain, int(self._rng.integers(0, np.iinfo(np.int32).max))
                 ).sample()
-                if self._place_and_settle() and self._precheck_is_stuck():
+                if not self._place_and_settle():
+                    unstable_candidates += 1
+                    continue
+                if self._precheck_is_stuck():
                     accepted = True
                     break
+                mobile_or_tipped_candidates += 1
             if accepted:
                 break
             # This terrain did not offer a stable sampled scenario. Build a
@@ -224,9 +244,21 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             self._build_terrain_model()
 
         if not accepted:
+            if unstable_candidates > 0 and mobile_or_tipped_candidates == 0:
+                suggestion = "All sampled starts failed to settle; reducing terrain height range may help."
+            elif mobile_or_tipped_candidates > 0 and unstable_candidates == 0:
+                suggestion = (
+                    "All stable starts moved during the precheck; increasing terrain height range or "
+                    "sampling more difficult spawn locations may help."
+                )
+            else:
+                suggestion = (
+                    "Some starts were unstable and the remaining stable starts moved during the precheck; "
+                    "adjust terrain relief more gradually or improve the scenario sampler."
+                )
             raise RuntimeError(
-                "Could not find a stable, stuck rover spawn after terrain and scenario retries. "
-                "Reduce terrain height range, increase --precheck-translation, or relax the scenario sampler."
+                "Could not find a stable, stuck rover spawn after terrain and scenario retries "
+                f"(unstable={unstable_candidates}, mobile_or_tipped={mobile_or_tipped_candidates}). {suggestion}"
             )
 
         self._step_count = 0
@@ -307,7 +339,10 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             and np.linalg.norm(angular_velocity) < 0.12
             and abs(roll) < 0.85
             and abs(pitch) < 0.85
-            and self._body_contact_count() == 0
+            # Stable non-wheel contact is a valid recovery start: a base or
+            # rocker resting on a ditch shoulder/ridge is precisely the type
+            # of high-centred condition this task should learn to escape.
+            and self._body_contact_count() <= self.spawn_max_body_contacts
         )
 
     def _precheck_is_stuck(self) -> bool:
@@ -325,19 +360,41 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         saved_time = self.data.time
         self._precheck_max_translation_m = 0.0
         self._precheck_yaw_change_rad = 0.0
+        self._precheck_frames.clear()
 
-        probes = ((0.45, 0.0, 0.0), (0.0, 0.45, 0.0), (0.0, 0.0, 0.60))
-        for vx, vy, wz in probes:
+        probes = (
+            ("forward", 0.80, 0.0, 0.0),
+            ("sideways", 0.0, 0.80, 0.0),
+            ("yaw", 0.0, 0.0, 0.80),
+        )
+        for name, vx, vy, wz in probes:
             # Each probe starts from the same settled state.  Otherwise a
             # forward probe could make the following sideways probe easier.
             self._restore_state(saved_qpos, saved_qvel, saved_act, saved_ctrl, saved_time)
+            probe_action = self._twist_probe_action(vx, vy, wz)
+            # The old probe measured while the steering brackets were still
+            # travelling to their command. On flat ground that incorrectly
+            # looked like a stuck rover. Pre-position the steering with zero
+            # wheel speed, then begin the actual mobility measurement.
+            steering_only_action = probe_action.copy()
+            steering_only_action[:4] = 0.0
+            self._capture_precheck_frame(f"precheck: {name} (steering)")
+            for _ in range(self.precheck_steering_steps):
+                self._apply_direct_action(steering_only_action)
+                for _ in range(self._substeps):
+                    mujoco.mj_step(self.model, self.data)
+
             start_xy = self._body_xy()
             start_yaw = self._yaw()
-            probe_action = self._twist_probe_action(vx, vy, wz)
-            for _ in range(self.precheck_control_steps):
+            self._capture_precheck_frame(f"precheck: {name} (drive)")
+            for step in range(self.precheck_control_steps):
                 self._apply_direct_action(probe_action)
                 for _ in range(self._substeps):
                     mujoco.mj_step(self.model, self.data)
+                # Five frames per probe is enough to see motion without
+                # retaining large RGB videos in every vector-environment worker.
+                if (step + 1) % max(1, math.ceil(self.precheck_control_steps / 4)) == 0:
+                    self._capture_precheck_frame(f"precheck: {name}")
             self._precheck_max_translation_m = max(
                 self._precheck_max_translation_m, float(np.linalg.norm(self._body_xy() - start_xy))
             )
@@ -346,12 +403,29 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             )
             roll, pitch = self._roll_pitch()
             if abs(roll) > 0.85 or abs(pitch) > 0.85:
+                self._precheck_frames.clear()
                 return False
 
         is_stuck = self._precheck_max_translation_m < self.precheck_translation_m
         if is_stuck:
             self._restore_state(saved_qpos, saved_qvel, saved_act, saved_ctrl, saved_time)
+        else:
+            self._precheck_frames.clear()
         return is_stuck
+
+    def _capture_precheck_frame(self, label: str) -> None:
+        if self.record_precheck_frames:
+            self._precheck_frames.append((label, self.render()))
+
+    def consume_precheck_frames(self) -> list[tuple[str, np.ndarray]]:
+        """Return-and-clear probe frames from the current accepted reset.
+
+        This is intentionally opt-in. It is for inspecting the reset filter,
+        not for normal training, where retaining RGB frames would be wasteful.
+        """
+        frames = self._precheck_frames
+        self._precheck_frames = []
+        return frames
 
     def _restore_state(
         self,

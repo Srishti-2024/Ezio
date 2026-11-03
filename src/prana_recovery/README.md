@@ -7,12 +7,12 @@ the manual 4-wheel-independent-steering teleop and kinematics.
 ## Procedural recovery environment
 
 `scripts/prana_recovery/terrain.py` creates a seeded heightfield from two
-smooth-noise scales plus randomized Gaussian bumps and depressions.
-`scenarios.py` samples a rover spawn where local slope and roughness are high.
-There is deliberately no egress target: the recovery policy must establish
-safe, sustained translation from a stuck start. Every terrain seed and scenario
-seed is retained in the environment `info` dictionary, so an episode can be
-replayed.
+smooth-noise scales, randomized Gaussian features, and elongated procedural
+ditches. `scenarios.py` places the rover only on a ditch floor, heading across
+one shoulder; it no longer selects arbitrary high-slope hills. There is
+deliberately no egress target: the recovery policy must establish safe,
+sustained translation from a stuck start. Every terrain seed and scenario seed
+is retained in the environment `info` dictionary, so an episode can be replayed.
 
 `env.py` is the Gymnasium boundary. It exposes eight normalized direct motor
 commands in this fixed order:
@@ -52,10 +52,15 @@ the wheels `1.5 cm` above the terrain. It then applies zero control until the
 rover is stable. Failed placements are retried internally and never become PPO
 episodes. Adjust `--spawn-contact-clearance` only if the wheel geometry needs
 more or less initial clearance; use the same value when evaluating a policy.
+Unlike ordinary driving simulation, a calm chassis/rocker collision at spawn
+is permitted: it can represent a high-centred rover resting on terrain. PPO
+success still requires clearing all non-wheel collision contacts.
 
-After settling, each candidate receives three short, scripted probes: forward,
-sideways/crab, and yaw. A candidate that translates at least `0.30 m` during
-any probe is already mobile, so it is discarded internally before PPO sees it.
+After settling, each candidate receives three scripted probes: forward,
+sideways/crab, and yaw. Each first aligns the steering with zero drive for ten
+control steps, then measures 30 stronger drive steps. A candidate that
+translates at least `0.30 m` during any probe is already mobile, so it is
+discarded internally before PPO sees it.
 Yaw alone does not reject a candidate. For a genuinely stuck candidate, the
 exact settled state is restored before PPO begins. Recovery succeeds only after
 the rover sustains planar translation for a rolling window (`20` control steps
@@ -72,6 +77,11 @@ line options and must match between training and evaluation.
 
 For inspection of one evaluated rover in MuJoCo's normal interactive free
 camera, use `evaluate_prana_recovery.py --mujoco-viewer --episodes 1`.
+
+To inspect the reset filter itself, add `--render --show-precheck` to training
+or evaluation. The existing Matplotlib window replays the accepted candidate's
+forward, sideways, and yaw probes before showing PPO control. This option is
+for debugging only: recording RGB frames and replaying them slows training.
 
 The terrain generator and sampler have no PPO dependency. A later focused
 scenario family can be added beside `ScenarioSampler`, then selected by a new

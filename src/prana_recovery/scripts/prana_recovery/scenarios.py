@@ -1,4 +1,4 @@
-"""Select reproducible rover spawn poses on generated terrain."""
+"""Select reproducible rover spawn poses in generated ditches."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class RecoveryScenario:
 
 
 class ScenarioSampler:
-    """Choose a relatively difficult, reproducible rover start."""
+    """Choose a reproducible start on the floor of a procedural ditch."""
 
     def __init__(self, terrain: ProceduralTerrain, seed: int) -> None:
         self.terrain = terrain
@@ -29,29 +29,24 @@ class ScenarioSampler:
 
     def sample(self) -> RecoveryScenario:
         terrain = self.terrain
-        margin = 2.0
-        candidates: list[tuple[float, float, float]] = []
-        for _ in range(400):
-            x_m, y_m = self.rng.uniform(
-                -terrain.config.half_extent_m + margin,
-                terrain.config.half_extent_m - margin,
-                size=2,
-            )
-            difficulty = terrain.difficulty_at(x_m, y_m)
-            if 0.22 <= difficulty <= 0.82:
-                candidates.append((float(x_m), float(y_m), difficulty))
+        if not terrain.ditches:
+            raise RuntimeError("Terrain has no procedural ditches; set TerrainConfig.ditch_count above zero.")
 
-        if not candidates:
-            raise RuntimeError("Terrain had no valid recovery spawn candidates; try another terrain seed.")
-
-        weights = np.array([candidate[2] ** 2 for candidate in candidates], dtype=np.float64)
-        spawn_x, spawn_y, difficulty = candidates[
-            self.rng.choice(len(candidates), p=weights / weights.sum())
-        ]
+        ditch = terrain.ditches[int(self.rng.integers(len(terrain.ditches)))]
+        # Keep the rover on the valley floor, with modest longitudinal jitter.
+        # Its heading points across a ditch wall, making the initial recovery
+        # question 'can I climb out?' rather than 'can I drive along the ditch?'
+        along_m = float(self.rng.uniform(-0.20, 0.20) * ditch.length_m)
+        across_m = float(self.rng.uniform(-0.12, 0.12) * ditch.width_m)
+        forward = np.array([np.cos(ditch.yaw_rad), np.sin(ditch.yaw_rad)])
+        left = np.array([-np.sin(ditch.yaw_rad), np.cos(ditch.yaw_rad)])
+        spawn_xy = np.asarray(ditch.center_xy_m) + along_m * forward + across_m * left
+        spawn_x, spawn_y = (float(spawn_xy[0]), float(spawn_xy[1]))
+        difficulty = terrain.difficulty_at(spawn_x, spawn_y)
         return RecoveryScenario(
             terrain_seed=terrain.seed,
             spawn_xy_m=(spawn_x, spawn_y),
-            spawn_yaw_rad=float(self.rng.uniform(-np.pi, np.pi)),
+            spawn_yaw_rad=float(ditch.yaw_rad + np.pi / 2.0 + self.rng.uniform(-0.20, 0.20)),
             difficulty=float(difficulty),
         )
 

@@ -38,8 +38,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render", action="store_true", help="Show selected real PPO workers in one live grid window")
     parser.add_argument("--render-envs", type=int, default=4, help="Maximum workers to display with --render")
     parser.add_argument("--render-every", type=int, default=25, help="Render every N vector-environment steps")
+    parser.add_argument(
+        "--show-precheck",
+        action="store_true",
+        help="Replay accepted forward/crab/yaw stuckness probes in the render window; requires --render",
+    )
     parser.add_argument("--history-frames", type=int, default=4, help="Past camera/state frames per observation")
-    parser.add_argument("--precheck-steps", type=int, default=15, help="Control steps in each initial mobility probe")
+    parser.add_argument(
+        "--precheck-steering-steps",
+        type=int,
+        default=10,
+        help="Zero-drive control steps used to align steering before every mobility probe",
+    )
+    parser.add_argument("--precheck-steps", type=int, default=30, help="Measured drive control steps in each mobility probe")
     parser.add_argument("--precheck-translation", type=float, default=0.30, help="Metres of probe movement that rejects a spawn")
     parser.add_argument("--mobility-window-steps", type=int, default=20, help="Consecutive control steps required for recovery")
     parser.add_argument("--mobility-displacement", type=float, default=0.50, help="Net metres required inside recovery window")
@@ -73,10 +84,13 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     if args.render_envs < 1 or args.render_every < 1:
         raise SystemExit("--render-envs and --render-every must both be positive.")
+    if args.show_precheck and not args.render:
+        raise SystemExit("--show-precheck requires --render.")
     if args.terrain_height_range <= 0.0 or args.spawn_contact_clearance < 0.0:
         raise SystemExit("--terrain-height-range must be positive and --spawn-contact-clearance cannot be negative.")
     if (
         args.history_frames < 1
+        or args.precheck_steering_steps < 1
         or args.precheck_steps < 1
         or args.mobility_window_steps < 1
         or args.precheck_translation <= 0.0
@@ -87,11 +101,13 @@ def main() -> None:
     terrain_config = TerrainConfig(height_range_m=args.terrain_height_range)
     recovery_options = {
         "history_frames": args.history_frames,
+        "precheck_steering_steps": args.precheck_steering_steps,
         "precheck_control_steps": args.precheck_steps,
         "precheck_translation_m": args.precheck_translation,
         "mobility_window_steps": args.mobility_window_steps,
         "mobility_displacement_m": args.mobility_displacement,
         "mobility_path_m": args.mobility_path,
+        "record_precheck_frames": args.show_precheck,
     }
     environment = SubprocVecEnv(
         [
@@ -115,6 +131,7 @@ def main() -> None:
         callback = TrainingMosaicCallback(
             every_steps=args.render_every,
             worker_count=min(args.render_envs, args.num_envs),
+            show_precheck=args.show_precheck,
         )
     try:
         model.learn(total_timesteps=args.timesteps, progress_bar=True, callback=callback)

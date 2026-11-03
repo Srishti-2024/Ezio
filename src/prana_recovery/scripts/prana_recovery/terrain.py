@@ -21,6 +21,20 @@ class TerrainConfig:
     feature_count: int = 16
     feature_amplitude_m: float = 0.28
     feature_radius_range_m: tuple[float, float] = (0.22, 0.85)
+    ditch_count: int = 6
+    ditch_width_range_m: tuple[float, float] = (0.35, 0.75)
+    ditch_length_range_m: tuple[float, float] = (2.0, 4.5)
+    ditch_depth_m: float = 0.65
+
+
+@dataclass(frozen=True)
+class DitchFeature:
+    """One seeded elongated depression available to the scenario sampler."""
+
+    center_xy_m: tuple[float, float]
+    yaw_rad: float
+    width_m: float
+    length_m: float
 
 
 class ProceduralTerrain:
@@ -30,6 +44,7 @@ class ProceduralTerrain:
         self.config = config
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
+        self.ditches: list[DitchFeature] = []
         self.heights_m = self._generate()
         self.cell_size_m = 2.0 * config.half_extent_m / (config.resolution - 1)
         gradient_y, gradient_x = np.gradient(self.heights_m, self.cell_size_m, self.cell_size_m)
@@ -60,6 +75,34 @@ class ProceduralTerrain:
             radius = self.rng.uniform(*config.feature_radius_range_m)
             amplitude = self.rng.uniform(-config.feature_amplitude_m, config.feature_amplitude_m)
             terrain += amplitude * np.exp(-((x - center_x) ** 2 + (y - center_y) ** 2) / (2.0 * radius**2))
+
+        # Smooth random noise alone mostly creates slopes that a 4WIS rover
+        # can simply drive across. Add explicit elongated valleys so resets can
+        # begin in a geometrically meaningful ditch rather than on a hill.
+        ditch_margin = 2.8
+        for _ in range(config.ditch_count):
+            center_x, center_y = self.rng.uniform(
+                -config.half_extent_m + ditch_margin,
+                config.half_extent_m - ditch_margin,
+                size=2,
+            )
+            yaw_rad = float(self.rng.uniform(-np.pi, np.pi))
+            width_m = float(self.rng.uniform(*config.ditch_width_range_m))
+            length_m = float(self.rng.uniform(*config.ditch_length_range_m))
+            self.ditches.append(
+                DitchFeature(
+                    center_xy_m=(float(center_x), float(center_y)),
+                    yaw_rad=yaw_rad,
+                    width_m=width_m,
+                    length_m=length_m,
+                )
+            )
+            along = (x - center_x) * np.cos(yaw_rad) + (y - center_y) * np.sin(yaw_rad)
+            across = -(x - center_x) * np.sin(yaw_rad) + (y - center_y) * np.cos(yaw_rad)
+            # A super-Gaussian keeps the ditch floor relatively flat while
+            # retaining steep shoulders that make climbing out non-trivial.
+            shape = np.exp(-0.5 * ((along / (length_m / 2.0)) ** 8 + (across / width_m) ** 4))
+            terrain -= config.ditch_depth_m * shape
 
         terrain -= terrain.min()
         maximum = float(terrain.max())
