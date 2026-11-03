@@ -73,6 +73,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         settle_max_steps: int = 750,
         settle_stable_steps: int = 50,
         spawn_attempts: int = 10,
+        max_reset_terrain_attempts: int = 20,
         spawn_max_body_contacts: int = 8,
         history_frames: int = 4,
         precheck_steering_steps: int = 10,
@@ -91,7 +92,12 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self.max_episode_steps = max_episode_steps
         if spawn_contact_clearance_m < 0.0:
             raise ValueError("spawn_contact_clearance_m must not be negative.")
-        if settle_max_steps < 1 or settle_stable_steps < 1 or spawn_attempts < 1:
+        if (
+            settle_max_steps < 1
+            or settle_stable_steps < 1
+            or spawn_attempts < 1
+            or max_reset_terrain_attempts < 1
+        ):
             raise ValueError("settling and spawn attempt counts must be positive.")
         if spawn_max_body_contacts < 0:
             raise ValueError("spawn_max_body_contacts must not be negative.")
@@ -108,6 +114,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self.settle_max_steps = settle_max_steps
         self.settle_stable_steps = settle_stable_steps
         self.spawn_attempts = spawn_attempts
+        self.max_reset_terrain_attempts = max_reset_terrain_attempts
         self.spawn_max_body_contacts = spawn_max_body_contacts
         self.history_frames = history_frames
         self.precheck_steering_steps = precheck_steering_steps
@@ -136,6 +143,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._mobility_speeds: deque[float] = deque(maxlen=mobility_window_steps)
         self._precheck_max_translation_m = 0.0
         self._precheck_yaw_change_rad = 0.0
+        self._reset_terrain_attempts = 0
         self._precheck_frames: list[tuple[str, np.ndarray]] = []
         self._free_joint_qposadr = 0
         self._free_joint_dofadr = 0
@@ -224,7 +232,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         accepted = False
         unstable_candidates = 0
         mobile_or_tipped_candidates = 0
-        for _ in range(3):
+        for terrain_attempt in range(self.max_reset_terrain_attempts):
             assert self._terrain is not None
             for _ in range(self.spawn_attempts):
                 self._scenario = ScenarioSampler(
@@ -242,6 +250,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             # This terrain did not offer a stable sampled scenario. Build a
             # new one rather than presenting PPO with a falling rover.
             self._build_terrain_model()
+        self._reset_terrain_attempts = terrain_attempt + 1
 
         if not accepted:
             if unstable_candidates > 0 and mobile_or_tipped_candidates == 0:
@@ -258,7 +267,8 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 )
             raise RuntimeError(
                 "Could not find a stable, stuck rover spawn after terrain and scenario retries "
-                f"(unstable={unstable_candidates}, mobile_or_tipped={mobile_or_tipped_candidates}). {suggestion}"
+                f"({self.max_reset_terrain_attempts} terrain attempts; "
+                f"unstable={unstable_candidates}, mobile_or_tipped={mobile_or_tipped_candidates}). {suggestion}"
             )
 
         self._step_count = 0
@@ -685,6 +695,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "displacement_from_start_m": self._escape_distance(),
             "precheck_max_translation_m": self._precheck_max_translation_m,
             "precheck_yaw_change_rad": self._precheck_yaw_change_rad,
+            "reset_terrain_attempts": self._reset_terrain_attempts,
             "success": success,
             "tipped": tipped,
         }

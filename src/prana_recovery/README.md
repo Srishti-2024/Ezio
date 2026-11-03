@@ -13,6 +13,9 @@ one shoulder; it no longer selects arbitrary high-slope hills. There is
 deliberately no egress target: the recovery policy must establish safe,
 sustained translation from a stuck start. Every terrain seed and scenario seed
 is retained in the environment `info` dictionary, so an episode can be replayed.
+If a generated terrain has no accepted stuck start, reset discards it internally
+and tries up to 20 terrain seeds by default. This keeps a failed candidate from
+crashing a PPO worker; `reset_terrain_attempts` is reported in evaluation.
 
 `env.py` is the Gymnasium boundary. It exposes eight normalized direct motor
 commands in this fixed order:

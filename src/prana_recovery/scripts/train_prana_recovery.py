@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mobility-window-steps", type=int, default=20, help="Consecutive control steps required for recovery")
     parser.add_argument("--mobility-displacement", type=float, default=0.50, help="Net metres required inside recovery window")
     parser.add_argument("--mobility-path", type=float, default=0.60, help="Path metres required inside recovery window")
+    parser.add_argument(
+        "--max-reset-terrain-attempts",
+        type=int,
+        default=20,
+        help="Terrain seeds discarded internally before reset gives up (default: 20)",
+    )
     return parser.parse_args()
 
 
@@ -96,6 +102,7 @@ def main() -> None:
         or args.precheck_translation <= 0.0
         or args.mobility_displacement <= 0.0
         or args.mobility_path <= 0.0
+        or args.max_reset_terrain_attempts < 1
     ):
         raise SystemExit("Recovery history, step counts, and distance thresholds must all be positive.")
     terrain_config = TerrainConfig(height_range_m=args.terrain_height_range)
@@ -107,6 +114,7 @@ def main() -> None:
         "mobility_window_steps": args.mobility_window_steps,
         "mobility_displacement_m": args.mobility_displacement,
         "mobility_path_m": args.mobility_path,
+        "max_reset_terrain_attempts": args.max_reset_terrain_attempts,
         "record_precheck_frames": args.show_precheck,
     }
     environment = SubprocVecEnv(
