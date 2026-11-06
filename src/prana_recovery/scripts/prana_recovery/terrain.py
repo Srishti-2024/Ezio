@@ -76,6 +76,18 @@ class ProceduralTerrain:
             amplitude = self.rng.uniform(-config.feature_amplitude_m, config.feature_amplitude_m)
             terrain += amplitude * np.exp(-((x - center_x) ** 2 + (y - center_y) ** 2) / (2.0 * radius**2))
 
+        # Reserve a known portion of the final height range for the ditches.
+        # Previously the full terrain was normalized only after carving; a
+        # single random hill could therefore make the same nominal ditch much
+        # shallower on one seed than another.
+        terrain -= terrain.min()
+        maximum = float(terrain.max())
+        effective_ditch_depth_m = min(config.ditch_depth_m, 0.55 * config.height_range_m)
+        background_range_m = config.height_range_m - effective_ditch_depth_m
+        if maximum > 1e-8:
+            terrain *= background_range_m / maximum
+        terrain += effective_ditch_depth_m
+
         # Smooth random noise alone mostly creates slopes that a 4WIS rover
         # can simply drive across. Add explicit elongated valleys so resets can
         # begin in a geometrically meaningful ditch rather than on a hill.
@@ -102,12 +114,11 @@ class ProceduralTerrain:
             # A super-Gaussian keeps the ditch floor relatively flat while
             # retaining steep shoulders that make climbing out non-trivial.
             shape = np.exp(-0.5 * ((along / (length_m / 2.0)) ** 8 + (across / width_m) ** 4))
-            terrain -= config.ditch_depth_m * shape
+            terrain -= effective_ditch_depth_m * shape
 
-        terrain -= terrain.min()
-        maximum = float(terrain.max())
-        if maximum > 1e-8:
-            terrain *= config.height_range_m / maximum
+        # Overlapping valleys may meet at the floor, but never create an
+        # invalid negative MuJoCo heightfield sample.
+        terrain = np.clip(terrain, 0.0, config.height_range_m)
         return terrain.astype(np.float64)
 
     def _local_roughness(self, radius_cells: int) -> np.ndarray:

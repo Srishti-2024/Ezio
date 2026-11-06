@@ -39,8 +39,10 @@ elevation map plus an observed/unobserved mask. PPO uses `MultiInputPolicy`:
 a small CNN processes that terrain map, an MLP processes the rover state, then
 their features are fused before producing the 4WIS motor command. By default
 the observation contains four consecutive frames: the terrain tensor therefore
-has 8 channels (4 × elevation/mask), and the numeric state has 96 values
-(4 × 24). This lets a feed-forward policy infer short-term motion without an
+has 8 channels (4 × elevation/mask), and the numeric state has 144 values
+(4 × 36): base motion, steering/wheel state, suspension angles, tyre contact
+bits, chassis-contact count, and the previous direct motor command. This lets a
+feed-forward policy infer short-term motion without an
 RNN. This replaces the previous target-based MLP environment, so old policies
 cannot be evaluated with this version and a new policy must be trained.
 
@@ -71,9 +73,9 @@ by default): at least `0.50 m` net displacement and `0.60 m` travelled path.
 Spinning in place cannot succeed.
 
 The target-free reward is proportional to increasing displacement from the
-settled start. It additionally rewards steady planar motion and uprightness,
-and penalizes power, abrupt motor-command changes, chassis contacts, and
-tipping. This does not claim to identify a globally optimal safe point without
+settled start. It additionally rewards steady planar motion, uprightness, and
+the release of chassis/rocker contacts. It penalizes power, abrupt motor-command
+changes, remaining chassis contacts, and tipping. This does not claim to identify a globally optimal safe point without
 a map or goal; it makes the preferred local result a farther, smoother,
 upright escape. The history, precheck, and success thresholds are all command
 line options and must match between training and evaluation.

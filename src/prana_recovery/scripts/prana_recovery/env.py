@@ -60,7 +60,16 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     TERRAIN_MAP_HEIGHT_SCALE_M = 1.5
     MAX_WHEEL_LINEAR_SPEED_M_S = 2.0
     MAX_STEERING_ANGLE_RAD = math.pi / 2.0
-    PROPRIOCEPTIVE_STATE_SIZE = 16
+    SUSPENSION_JOINTS = (
+        "rocker_left_joint",
+        "rocker_right_joint",
+        "differential_joint",
+        "LuniversalZ_joint",
+        "differentialL_joint",
+        "R_differential_Z_joint",
+        "differntialR_joint",
+    )
+    PROPRIOCEPTIVE_STATE_SIZE = 28
     ACTION_SIZE = 8
 
     def __init__(
@@ -135,6 +144,8 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._episodes_on_terrain = terrain_episodes
         self._step_count = 0
         self._previous_escape_distance_m = 0.0
+        self._initial_body_contacts = 0
+        self._previous_body_contacts = 0
         self._episode_start_xy = np.zeros(2, dtype=np.float64)
         self._last_action = np.zeros(self.ACTION_SIZE, dtype=np.float32)
         self._terrain_history: deque[np.ndarray] = deque(maxlen=history_frames)
@@ -204,7 +215,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
   </asset>
   <worldbody>
     <light pos="0 0 8" dir="0 0 -1" directional="true"/>
-    <geom name="procedural_terrain_geom" type="hfield" hfield="procedural_terrain" friction="1.0 0.005 0.0001" rgba="0.25 0.20 0.14 1"/>
+    <geom name="procedural_terrain_geom" type="hfield" hfield="procedural_terrain" friction="1.8 0.01 0.001" rgba="0.25 0.20 0.14 1"/>
   </worldbody>
   <include file="{compiled_path}"/>
 </mujoco>''',
@@ -275,6 +286,8 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._episodes_on_terrain += 1
         self._episode_start_xy = self._body_xy()
         self._previous_escape_distance_m = 0.0
+        self._initial_body_contacts = self._body_contact_count()
+        self._previous_body_contacts = self._initial_body_contacts
         self._last_action.fill(0.0)
         self._mobility_positions.clear()
         self._mobility_positions.append(self._episode_start_xy.copy())
@@ -481,23 +494,28 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
 
         # Target-free reward: get meaningfully away from the stuck start while
         # preferring sustained, upright, smooth translation over thrashing.
+        # Contact release is a dense signal for high-centred starts: it rewards
+        # breaking free, but only when the number of chassis contacts drops.
         energy = float(np.square(action).mean())
         action_change = float(np.square(action - self._last_action).mean())
         uprightness = max(0.0, 1.0 - (abs(roll_rad) + abs(pitch_rad)) / 0.70)
         sustained_motion = min(planar_speed_m_s / 0.45, 1.0)
+        contact_release = float(np.clip(self._previous_body_contacts - body_contacts, -2, 2))
         reward = (
-            8.0 * progress_m
-            + 0.03 * sustained_motion
+            7.0 * progress_m
+            + 0.04 * sustained_motion
             + 0.02 * uprightness
+            + 0.30 * contact_release
             - 0.01
-            - 0.015 * energy
-            - 0.010 * action_change
-            - 0.01 * body_contacts
+            - 0.020 * energy
+            - 0.015 * action_change
+            - 0.04 * body_contacts
         )
         if success:
-            reward += 15.0
+            reward += 25.0
         if tipped:
-            reward -= 10.0
+            reward -= 12.0
+        self._previous_body_contacts = body_contacts
         self._last_action = action.astype(np.float32)
         return self._observation(), float(reward), terminated, truncated, self._info(success=success, tipped=tipped)
 
@@ -598,11 +616,37 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         roll, pitch = self._roll_pitch()
         steering = np.array([self.data.qpos[self.model.joint(name).qposadr[0]] for name in ("bracker_lf_joint", "bracket_rf_joint", "bracket_lb_joint", "bracket_rb_joint")])
         wheel_velocity = np.array([self.data.qvel[self.model.joint(name).dofadr[0]] for name in ("wheel_fl_joint", "wheel_fr_joint", "wheel_lb_joint", "wheel_rb_joint")])
+        suspension = np.array(
+            [self.data.qpos[self.model.joint(name).qposadr[0]] for name in self.SUSPENSION_JOINTS],
+            dtype=np.float32,
+        )
+        wheel_contact_mask = self._wheel_contact_mask()
         proprioception = np.concatenate(
-            (velocity, angular_velocity, [roll, pitch], steering, wheel_velocity)
+            (
+                velocity,
+                angular_velocity,
+                [roll, pitch],
+                steering,
+                wheel_velocity,
+                suspension,
+                wheel_contact_mask,
+                [float(self._body_contact_count())],
+            )
         ).astype(np.float32)
         state = np.concatenate((proprioception, self._last_action)).astype(np.float32)
         return self._camera_elevation_map(rotation, position), state
+
+    def _wheel_contact_mask(self) -> np.ndarray:
+        """Return one ground-contact bit per tyre in fixed wheel order."""
+        contacted = np.zeros(len(WHEEL_NAMES), dtype=np.float32)
+        wheel_geom_to_index = {f"wheel_{wheel}_visual": index for index, wheel in enumerate(WHEEL_NAMES)}
+        for contact_index in range(self.data.ncon):
+            contact = self.data.contact[contact_index]
+            for geom_id in (contact.geom1, contact.geom2):
+                wheel_index = wheel_geom_to_index.get(self.model.geom(geom_id).name)
+                if wheel_index is not None:
+                    contacted[wheel_index] = 1.0
+        return contacted
 
     def _make_camera_ray_directions(self) -> np.ndarray:
         """Create normalized body-frame rays for a 65 degree front camera."""
@@ -693,6 +737,8 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "terrain_seed": self._scenario.terrain_seed,
             "difficulty": self._scenario.difficulty,
             "displacement_from_start_m": self._escape_distance(),
+            "initial_body_contacts": self._initial_body_contacts,
+            "body_contacts": self._body_contact_count(),
             "precheck_max_translation_m": self._precheck_max_translation_m,
             "precheck_yaw_change_rad": self._precheck_yaw_change_rad,
             "reset_terrain_attempts": self._reset_terrain_attempts,
