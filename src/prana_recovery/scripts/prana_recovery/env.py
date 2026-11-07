@@ -154,7 +154,9 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._mobility_speeds: deque[float] = deque(maxlen=mobility_window_steps)
         self._precheck_max_translation_m = 0.0
         self._precheck_yaw_change_rad = 0.0
+        self._precheck_tipped = False
         self._reset_terrain_attempts = 0
+        self._fallback_mobile_start = False
         self._precheck_frames: list[tuple[str, np.ndarray]] = []
         self._free_joint_qposadr = 0
         self._free_joint_dofadr = 0
@@ -195,8 +197,9 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             raise RuntimeError("Call reset() before accessing MuJoCo data.")
         return self._data
 
-    def _build_terrain_model(self) -> None:
-        terrain_seed = int(self._rng.integers(0, np.iinfo(np.int32).max))
+    def _build_terrain_model(self, terrain_seed: int | None = None) -> None:
+        if terrain_seed is None:
+            terrain_seed = int(self._rng.integers(0, np.iinfo(np.int32).max))
         self._terrain = ProceduralTerrain(self.terrain_config, terrain_seed)
         workspace = Path(self._temporary_directory.name)
         hfield_path = workspace / f"terrain_{terrain_seed}.bin"
@@ -233,6 +236,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self, *, seed: int | None = None, options: dict | None = None
     ) -> tuple[dict[str, np.ndarray], dict]:
         super().reset(seed=seed)
+        self._fallback_mobile_start = False
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         # An explicit seed must fully reproduce an episode, including its
@@ -241,8 +245,13 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             self._build_terrain_model()
 
         accepted = False
-        unstable_candidates = 0
-        mobile_or_tipped_candidates = 0
+        # A Gym reset must always return an observation. If the configured
+        # search budget finds no truly stuck start, retain the least-mobile,
+        # non-tipping stable candidate and return it as a one-step skipped
+        # episode rather than killing a SubprocVecEnv worker.
+        fallback: tuple[
+            int, RecoveryScenario, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float
+        ] | None = None
         for terrain_attempt in range(self.max_reset_terrain_attempts):
             assert self._terrain is not None
             for _ in range(self.spawn_attempts):
@@ -250,12 +259,24 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                     self._terrain, int(self._rng.integers(0, np.iinfo(np.int32).max))
                 ).sample()
                 if not self._place_and_settle():
-                    unstable_candidates += 1
                     continue
                 if self._precheck_is_stuck():
                     accepted = True
                     break
-                mobile_or_tipped_candidates += 1
+                if not self._precheck_tipped:
+                    candidate = (
+                        self._terrain.seed,
+                        self._scenario,
+                        self.data.qpos.copy(),
+                        self.data.qvel.copy(),
+                        self.data.act.copy(),
+                        self.data.ctrl.copy(),
+                        self.data.time,
+                        self._precheck_max_translation_m,
+                        self._precheck_yaw_change_rad,
+                    )
+                    if fallback is None or candidate[-2] < fallback[-2]:
+                        fallback = candidate
             if accepted:
                 break
             # This terrain did not offer a stable sampled scenario. Build a
@@ -264,23 +285,45 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._reset_terrain_attempts = terrain_attempt + 1
 
         if not accepted:
-            if unstable_candidates > 0 and mobile_or_tipped_candidates == 0:
-                suggestion = "All sampled starts failed to settle; reducing terrain height range may help."
-            elif mobile_or_tipped_candidates > 0 and unstable_candidates == 0:
-                suggestion = (
-                    "All stable starts moved during the precheck; increasing terrain height range or "
-                    "sampling more difficult spawn locations may help."
-                )
-            else:
-                suggestion = (
-                    "Some starts were unstable and the remaining stable starts moved during the precheck; "
-                    "adjust terrain relief more gradually or improve the scenario sampler."
-                )
-            raise RuntimeError(
-                "Could not find a stable, stuck rover spawn after terrain and scenario retries "
-                f"({self.max_reset_terrain_attempts} terrain attempts; "
-                f"unstable={unstable_candidates}, mobile_or_tipped={mobile_or_tipped_candidates}). {suggestion}"
-            )
+            # There is normally at least one stable candidate. Keep searching
+            # only in the pathological all-unstable case; this never crashes a
+            # worker, but avoids inventing an invalid physical state.
+            while fallback is None:
+                self._build_terrain_model()
+                assert self._terrain is not None
+                for _ in range(self.spawn_attempts):
+                    self._scenario = ScenarioSampler(
+                        self._terrain, int(self._rng.integers(0, np.iinfo(np.int32).max))
+                    ).sample()
+                    if not self._place_and_settle() or self._precheck_is_stuck() or self._precheck_tipped:
+                        continue
+                    fallback = (
+                        self._terrain.seed,
+                        self._scenario,
+                        self.data.qpos.copy(),
+                        self.data.qvel.copy(),
+                        self.data.act.copy(),
+                        self.data.ctrl.copy(),
+                        self.data.time,
+                        self._precheck_max_translation_m,
+                        self._precheck_yaw_change_rad,
+                    )
+                    break
+
+            (
+                terrain_seed,
+                self._scenario,
+                qpos,
+                qvel,
+                act,
+                ctrl,
+                time_s,
+                self._precheck_max_translation_m,
+                self._precheck_yaw_change_rad,
+            ) = fallback
+            self._build_terrain_model(terrain_seed)
+            self._restore_state(qpos, qvel, act, ctrl, time_s)
+            self._fallback_mobile_start = True
 
         self._step_count = 0
         self._episodes_on_terrain += 1
@@ -383,6 +426,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         saved_time = self.data.time
         self._precheck_max_translation_m = 0.0
         self._precheck_yaw_change_rad = 0.0
+        self._precheck_tipped = False
         self._precheck_frames.clear()
 
         probes = (
@@ -426,13 +470,14 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             )
             roll, pitch = self._roll_pitch()
             if abs(roll) > 0.85 or abs(pitch) > 0.85:
+                self._precheck_tipped = True
                 self._precheck_frames.clear()
+                self._restore_state(saved_qpos, saved_qvel, saved_act, saved_ctrl, saved_time)
                 return False
 
         is_stuck = self._precheck_max_translation_m < self.precheck_translation_m
-        if is_stuck:
-            self._restore_state(saved_qpos, saved_qvel, saved_act, saved_ctrl, saved_time)
-        else:
+        self._restore_state(saved_qpos, saved_qvel, saved_act, saved_ctrl, saved_time)
+        if not is_stuck:
             self._precheck_frames.clear()
         return is_stuck
 
@@ -472,6 +517,13 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         return np.clip(np.concatenate((drive, steer)), -1.0, 1.0)
 
     def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
+        if self._fallback_mobile_start:
+            # This reset exhausted its proper stuck-start search. Report one
+            # zero-reward truncated transition so vectorized PPO advances to a
+            # fresh terrain without learning from a mobile fallback state.
+            self._fallback_mobile_start = False
+            return self._stacked_observation(), 0.0, False, True, self._info(skipped=True)
+
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         self._apply_direct_action(action)
         for _ in range(self._substeps):
@@ -731,7 +783,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         elevation[observed < 0.0] = 0.0
         return np.stack((np.clip(elevation, -1.0, 1.0), observed))
 
-    def _info(self, *, success: bool = False, tipped: bool = False) -> dict:
+    def _info(self, *, success: bool = False, tipped: bool = False, skipped: bool = False) -> dict:
         assert self._scenario is not None
         return {
             "terrain_seed": self._scenario.terrain_seed,
@@ -742,6 +794,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "precheck_max_translation_m": self._precheck_max_translation_m,
             "precheck_yaw_change_rad": self._precheck_yaw_change_rad,
             "reset_terrain_attempts": self._reset_terrain_attempts,
+            "skipped": skipped,
             "success": success,
             "tipped": tipped,
         }

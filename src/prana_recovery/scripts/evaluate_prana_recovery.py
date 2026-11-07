@@ -139,6 +139,7 @@ def main() -> None:
 
         mujoco_viewer_module = mujoco.viewer
     successes = 0
+    skipped_episodes = 0
     returns: list[float] = []
     try:
         for episode in range(args.episodes):
@@ -162,18 +163,27 @@ def main() -> None:
                         viewer.update(environment.render(), episode=episode, step=step)
                     if terminated or truncated:
                         break
-            successes += int(info["success"])
-            returns.append(episode_return)
+            if info["skipped"]:
+                skipped_episodes += 1
+            else:
+                successes += int(info["success"])
+                returns.append(episode_return)
             print(
                 f"episode={episode:03d} seed={info['terrain_seed']} difficulty={info['difficulty']:.2f} "
                 f"reset_terrains={info['reset_terrain_attempts']} "
-                f"success={info['success']} return={episode_return:.2f}"
+                f"skipped={info['skipped']} success={info['success']} return={episode_return:.2f}"
             )
     finally:
         if viewer is not None:
             viewer.close()
         environment.close()
-    print(f"success_rate={successes / args.episodes:.1%} mean_return={sum(returns) / len(returns):.2f}")
+    evaluated = args.episodes - skipped_episodes
+    success_rate = successes / evaluated if evaluated else 0.0
+    mean_return = sum(returns) / len(returns) if returns else 0.0
+    print(
+        f"success_rate={success_rate:.1%} mean_return={mean_return:.2f} "
+        f"evaluated={evaluated} skipped={skipped_episodes}"
+    )
 
 
 if __name__ == "__main__":
