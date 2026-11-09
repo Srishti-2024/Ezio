@@ -36,6 +36,21 @@ Training is headless by default. For a short visual inspection, add
 forward, sideways, and yaw tests used to verify that a sampled rover is really
 stuck; it is not recommended for a long run because rendering is expensive.
 
+Fine-tune a compatible saved policy with `--resume`; `--timesteps` is then the
+number of **additional** training steps. Use a new output directory:
+
+```bash
+python3 src/prana_recovery/scripts/train_prana_recovery.py \
+  --num-envs 8 --timesteps 1000000 --device cuda \
+  --resume runs/prana_recovery_ditches_1/ppo_prana_recovery \
+  --output runs/prana_recovery_ditches_1_continue \
+  --terrain-height-range 1.0
+```
+
+Resuming requires the same action space and observation shape, including the
+history length and numeric state fields. Terrain seeds, terrain relief, and
+reward weights may change.
+
 Important training parameters include:
 
 - `--num-envs`, `--timesteps`, `--device`, `--output`

@@ -22,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="PPO device: auto, cpu, cuda, or cuda:0")
     parser.add_argument("--output", type=Path, default=Path("runs/prana_recovery"))
     parser.add_argument(
+        "--resume",
+        type=Path,
+        help="Saved PPO model to fine-tune; --timesteps is additional training, not a total",
+    )
+    parser.add_argument(
         "--terrain-height-range",
         type=float,
         default=0.65,
@@ -88,6 +93,8 @@ def main() -> None:
         ) from error
 
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.resume is not None and not (args.resume.exists() or args.resume.with_suffix(".zip").exists()):
+        raise SystemExit(f"Could not find resume model: {args.resume}")
     if args.render_envs < 1 or args.render_every < 1:
         raise SystemExit("--render-envs and --render-every must both be positive.")
     if args.show_precheck and not args.render:
@@ -123,17 +130,28 @@ def main() -> None:
             for index in range(args.num_envs)
         ]
     )
-    model = PPO(
-        "MultiInputPolicy",
-        environment,
-        verbose=1,
-        seed=args.seed,
-        device=args.device,
-        tensorboard_log=str(args.output / "tensorboard"),
-        n_steps=1024,
-        batch_size=256,
-        policy_kwargs={"features_extractor_class": RoverTerrainExtractor},
-    )
+    tensorboard_log = str(args.output / "tensorboard")
+    if args.resume is None:
+        model = PPO(
+            "MultiInputPolicy",
+            environment,
+            verbose=1,
+            seed=args.seed,
+            device=args.device,
+            tensorboard_log=tensorboard_log,
+            n_steps=1024,
+            batch_size=256,
+            policy_kwargs={"features_extractor_class": RoverTerrainExtractor},
+        )
+    else:
+        print(f"Resuming PPO policy from {args.resume}")
+        model = PPO.load(
+            args.resume,
+            env=environment,
+            device=args.device,
+            tensorboard_log=tensorboard_log,
+            verbose=1,
+        )
     callback = None
     if args.render:
         callback = TrainingMosaicCallback(
@@ -142,7 +160,12 @@ def main() -> None:
             show_precheck=args.show_precheck,
         )
     try:
-        model.learn(total_timesteps=args.timesteps, progress_bar=True, callback=callback)
+        model.learn(
+            total_timesteps=args.timesteps,
+            reset_num_timesteps=args.resume is None,
+            progress_bar=True,
+            callback=callback,
+        )
         model.save(str(args.output / "ppo_prana_recovery"))
     finally:
         environment.close()
