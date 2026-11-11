@@ -800,11 +800,15 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         }
 
     def render(self) -> np.ndarray:
-        """Return an RGB image of this worker's current MuJoCo state.
+        """Return the default rover-following RGB view used by evaluation."""
+        return self.render_camera(distance=3.2, azimuth=135.0, elevation=-28.0)
+
+    def render_camera(self, *, distance: float, azimuth: float, elevation: float) -> np.ndarray:
+        """Render a free camera focused on the rover's base.
 
         Training remains headless unless a caller explicitly requests these
-        frames.  The live-training viewer uses this method to tile frames from
-        several real ``SubprocVecEnv`` workers into one window.
+        frames. ``render()`` deliberately retains its original camera so live
+        training and existing evaluation behaviour stay unchanged.
         """
         if self._model is None or self._data is None:
             raise RuntimeError("Call reset() before rendering the environment.")
@@ -814,9 +818,9 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         camera = mujoco.MjvCamera()
         camera.type = mujoco.mjtCamera.mjCAMERA_FREE
         camera.lookat[:] = self._data.body("prana_mark2_v2").xpos
-        camera.distance = 3.2
-        camera.azimuth = 135.0
-        camera.elevation = -28.0
+        camera.distance = distance
+        camera.azimuth = azimuth
+        camera.elevation = elevation
         self._renderer.update_scene(self._data, camera=camera)
         return self._renderer.render()
 

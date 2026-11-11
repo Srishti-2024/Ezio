@@ -95,9 +95,9 @@ class TrainingMosaicCallback:
 
 
 class EvaluationFrameViewer:
-    """A small live window for the one MuJoCo world used by evaluation."""
+    """A live evaluation window with an optional second rover-following view."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, alternate_view: bool = False) -> None:
         try:
             import matplotlib.pyplot as plt
         except ImportError as error:
@@ -105,18 +105,33 @@ class EvaluationFrameViewer:
 
         self._plt = plt
         self._plt.ion()
-        self._figure, self._axis = self._plt.subplots(figsize=(6.4, 4.8))
-        self._axis.set_axis_off()
-        self._image = None
+        self._alternate_view = alternate_view
+        if alternate_view:
+            self._figure, axes = self._plt.subplots(1, 2, figsize=(12.8, 4.8))
+            self._axes = list(axes)
+        else:
+            self._figure, axis = self._plt.subplots(figsize=(6.4, 4.8))
+            self._axes = [axis]
+        for axis in self._axes:
+            axis.set_axis_off()
+        self._images = [None] * len(self._axes)
         self._figure.canvas.manager.set_window_title("Prana PPO evaluation")
         self._figure.tight_layout()
 
-    def update(self, frame, *, episode: int, step: int) -> None:
-        if self._image is None:
-            self._image = self._axis.imshow(frame)
-        else:
-            self._image.set_data(frame)
-        self._axis.set_title(f"Evaluation episode {episode}, step {step}")
+    def update(self, frame, *, episode: int, step: int, alternate_frame=None) -> None:
+        """Display the exact primary/alternate frames optionally written to MP4."""
+        frames = [frame]
+        if self._alternate_view:
+            if alternate_frame is None:
+                raise ValueError("alternate_frame is required when alternate_view is enabled.")
+            frames.append(alternate_frame)
+        for index, (axis, current) in enumerate(zip(self._axes, frames, strict=True)):
+            if self._images[index] is None:
+                self._images[index] = axis.imshow(current)
+            else:
+                self._images[index].set_data(current)
+            label = "primary" if index == 0 else "opposite overhead"
+            axis.set_title(f"Episode {episode}, step {step}: {label}")
         self._figure.canvas.draw_idle()
         self._figure.canvas.flush_events()
         self._plt.pause(0.001)
@@ -124,11 +139,11 @@ class EvaluationFrameViewer:
     def replay_precheck(self, frames, *, episode: int) -> None:
         """Show the accepted start's recorded forward/crab/yaw probes."""
         for label, frame in frames:
-            if self._image is None:
-                self._image = self._axis.imshow(frame)
+            if self._images[0] is None:
+                self._images[0] = self._axes[0].imshow(frame)
             else:
-                self._image.set_data(frame)
-            self._axis.set_title(f"Evaluation episode {episode}: {label}")
+                self._images[0].set_data(frame)
+            self._axes[0].set_title(f"Evaluation episode {episode}: {label}")
             self._figure.canvas.draw_idle()
             self._figure.canvas.flush_events()
             self._plt.pause(0.12)

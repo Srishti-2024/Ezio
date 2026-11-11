@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import time
 
@@ -35,6 +37,16 @@ def parse_args() -> argparse.Namespace:
         help="Wheel-to-terrain clearance at spawn in metres (default: 0.015)",
     )
     parser.add_argument("--render", action="store_true", help="Show the live MuJoCo evaluation episode")
+    parser.add_argument(
+        "--record-videos",
+        action="store_true",
+        help="Save renderer frames as MP4s in <model run>/evaluation_videos/.",
+    )
+    parser.add_argument(
+        "--alternate-view",
+        action="store_true",
+        help="Add an opposite, steeper overhead rover-following camera view.",
+    )
     parser.add_argument(
         "--show-precheck",
         action="store_true",
@@ -68,8 +80,49 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+class Mp4Recorder:
+    """Stream rendered RGB frames straight to ffmpeg as a compact MP4.
+
+    Feeding raw frames over stdin avoids a heavyweight Python video dependency
+    and avoids first storing a directory full of temporary PNG frames.
+    """
+
+    def __init__(self, path: Path, *, fps: float) -> None:
+        self.path = path
+        self.fps = fps
+        self._process: subprocess.Popen[bytes] | None = None
+
+    def write(self, frame) -> None:
+        if frame.dtype.name != "uint8" or frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("Expected an HxWx3 uint8 RGB frame from MuJoCo.")
+        if self._process is None:
+            height, width, _ = frame.shape
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._process = subprocess.Popen(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-vcodec", "rawvideo",
+                    "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(self.fps), "-i", "-",
+                    "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+                    str(self.path),
+                ],
+                stdin=subprocess.PIPE,
+            )
+        assert self._process.stdin is not None
+        self._process.stdin.write(frame.tobytes())
+
+    def close(self) -> None:
+        if self._process is None:
+            return
+        assert self._process.stdin is not None
+        self._process.stdin.close()
+        return_code = self._process.wait()
+        self._process = None
+        if return_code:
+            raise RuntimeError(f"ffmpeg failed while writing {self.path} (exit code {return_code}).")
+
+
 def run_episode(
-    environment: PranaRecoveryEnv, policy, observation, viewer=None
+    environment: PranaRecoveryEnv, policy, observation, viewer=None, frame_callback=None
 ) -> tuple[float, dict]:
     """Run one policy episode, optionally synchronising a native MuJoCo viewer."""
     episode_return = 0.0
@@ -80,6 +133,8 @@ def run_episode(
         started_at = time.monotonic()
         observation, reward, terminated, truncated, info = environment.step(action)
         episode_return += reward
+        if frame_callback is not None:
+            frame_callback(step=None)
         if viewer is not None:
             viewer.sync()
             time.sleep(max(0.0, environment.control_dt_s - (time.monotonic() - started_at)))
@@ -104,6 +159,10 @@ def main() -> None:
         raise SystemExit("Evaluation runs one environment, so --render-envs must be 1.")
     if args.render_every < 1:
         raise SystemExit("--render-every must be positive.")
+    if args.record_videos and shutil.which("ffmpeg") is None:
+        raise SystemExit("--record-videos needs the system 'ffmpeg' command, but it was not found on PATH.")
+    if args.alternate_view and not (args.render or args.record_videos):
+        raise SystemExit("--alternate-view needs --render and/or --record-videos.")
     if args.terrain_height_range <= 0.0 or args.spawn_contact_clearance < 0.0:
         raise SystemExit("--terrain-height-range must be positive and --spawn-contact-clearance cannot be negative.")
     if (
@@ -132,7 +191,7 @@ def main() -> None:
         seed=args.seed,
     )
     policy = PPO.load(args.model)
-    viewer = EvaluationFrameViewer() if args.render else None
+    viewer = EvaluationFrameViewer(alternate_view=args.alternate_view) if args.render else None
     mujoco_viewer_module = None
     if args.mujoco_viewer:
         import mujoco.viewer
@@ -141,28 +200,73 @@ def main() -> None:
     successes = 0
     skipped_episodes = 0
     returns: list[float] = []
+    model_stem = args.model.with_suffix("").name
+    video_directory = args.model.with_suffix("").parent / "evaluation_videos"
     try:
         for episode in range(args.episodes):
             observation, info = environment.reset(seed=args.seed + episode)
             if viewer is not None and args.show_precheck:
                 viewer.replay_precheck(environment.consume_precheck_frames(), episode=episode)
+            primary_recorder = None
+            alternate_recorder = None
+            if args.record_videos:
+                primary_recorder = Mp4Recorder(
+                    video_directory / f"{model_stem}_episode_{episode:03d}_primary.mp4",
+                    fps=1.0 / environment.control_dt_s,
+                )
+                if args.alternate_view:
+                    alternate_recorder = Mp4Recorder(
+                        video_directory / f"{model_stem}_episode_{episode:03d}_opposite_overhead.mp4",
+                        fps=1.0 / environment.control_dt_s,
+                    )
+
+            def handle_frame(*, step: int | None) -> None:
+                # Primary is exactly the existing Matplotlib camera: it follows
+                # the base at 3.2 m, azimuth 135°, elevation -28°.
+                primary = environment.render()
+                alternate = None
+                if args.alternate_view:
+                    alternate = environment.render_camera(distance=4.2, azimuth=315.0, elevation=-62.0)
+                if primary_recorder is not None:
+                    primary_recorder.write(primary)
+                if alternate_recorder is not None:
+                    assert alternate is not None
+                    alternate_recorder.write(alternate)
+                if viewer is not None and step is not None and step % args.render_every == 0:
+                    viewer.update(primary, alternate_frame=alternate, episode=episode, step=step)
+
             if mujoco_viewer_module is not None:
                 # A seeded reset creates a new MuJoCo model/heightfield, so a
                 # native viewer is opened per episode to stay attached to it.
-                with mujoco_viewer_module.launch_passive(environment.model, environment.data) as native_viewer:
-                    episode_return, info = run_episode(environment, policy, observation, native_viewer)
+                try:
+                    with mujoco_viewer_module.launch_passive(environment.model, environment.data) as native_viewer:
+                        episode_return, info = run_episode(
+                            environment, policy, observation, native_viewer,
+                            frame_callback=handle_frame if args.record_videos else None,
+                        )
+                finally:
+                    if primary_recorder is not None:
+                        primary_recorder.close()
+                    if alternate_recorder is not None:
+                        alternate_recorder.close()
             else:
                 episode_return = 0.0
                 step = 0
-                while True:
-                    action, _ = policy.predict(observation, deterministic=True)
-                    observation, reward, terminated, truncated, info = environment.step(action)
-                    episode_return += reward
-                    step += 1
-                    if viewer is not None and step % args.render_every == 0:
-                        viewer.update(environment.render(), episode=episode, step=step)
-                    if terminated or truncated:
-                        break
+                try:
+                    while True:
+                        action, _ = policy.predict(observation, deterministic=True)
+                        observation, reward, terminated, truncated, info = environment.step(action)
+                        episode_return += reward
+                        step += 1
+                        if viewer is not None or primary_recorder is not None:
+                            handle_frame(step=step)
+                        if terminated or truncated:
+                            break
+                finally:
+                    if primary_recorder is not None:
+                        primary_recorder.close()
+                    if alternate_recorder is not None:
+                        alternate_recorder.close()
             if info["skipped"]:
                 skipped_episodes += 1
             else:
