@@ -60,6 +60,11 @@ Important training parameters include:
   `--precheck-translation`
 - `--mobility-window-steps`, `--mobility-displacement`, `--mobility-path`
 - `--max-reset-terrain-attempts` (discarded terrain seeds before reset fails)
+- `--checkpoint-every` (periodic checkpoint interval; default 250000 steps)
+
+Checkpoints are written below `<output>/checkpoints`. Evaluate a checkpoint
+with fixed seeds to compare progress. Pressing `Ctrl+C` also saves the current
+policy as `ppo_prana_recovery_interrupted.zip` in the output directory.
 
 ## Evaluate
 

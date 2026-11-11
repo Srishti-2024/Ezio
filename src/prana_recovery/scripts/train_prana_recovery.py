@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Terrain seeds discarded internally before reset gives up (default: 20)",
     )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=250_000,
+        help="Save an intermediate checkpoint every N environment steps (default: 250000)",
+    )
     return parser.parse_args()
 
 
@@ -84,6 +90,7 @@ def main() -> None:
     args = parse_args()
     try:
         from stable_baselines3 import PPO
+        from stable_baselines3.common.callbacks import CheckpointCallback
         from stable_baselines3.common.vec_env import SubprocVecEnv
         from prana_recovery.policy import RoverTerrainExtractor
     except ImportError as error:
@@ -99,6 +106,8 @@ def main() -> None:
         raise SystemExit("--render-envs and --render-every must both be positive.")
     if args.show_precheck and not args.render:
         raise SystemExit("--show-precheck requires --render.")
+    if args.checkpoint_every < 1:
+        raise SystemExit("--checkpoint-every must be positive.")
     if args.terrain_height_range <= 0.0 or args.spawn_contact_clearance < 0.0:
         raise SystemExit("--terrain-height-range must be positive and --spawn-contact-clearance cannot be negative.")
     if (
@@ -152,21 +161,31 @@ def main() -> None:
             tensorboard_log=tensorboard_log,
             verbose=1,
         )
-    callback = None
+    callbacks = [
+        CheckpointCallback(
+            save_freq=max(1, args.checkpoint_every // args.num_envs),
+            save_path=str(args.output / "checkpoints"),
+            name_prefix="ppo_prana_recovery",
+        )
+    ]
     if args.render:
-        callback = TrainingMosaicCallback(
+        callbacks.append(TrainingMosaicCallback(
             every_steps=args.render_every,
             worker_count=min(args.render_envs, args.num_envs),
             show_precheck=args.show_precheck,
-        )
+        ))
     try:
         model.learn(
             total_timesteps=args.timesteps,
             reset_num_timesteps=args.resume is None,
             progress_bar=True,
-            callback=callback,
+            callback=callbacks,
         )
         model.save(str(args.output / "ppo_prana_recovery"))
+    except KeyboardInterrupt:
+        interrupted_path = args.output / "ppo_prana_recovery_interrupted"
+        model.save(str(interrupted_path))
+        print(f"Training interrupted; saved current PPO policy to {interrupted_path}.zip")
     finally:
         environment.close()
 
