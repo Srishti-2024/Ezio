@@ -150,7 +150,19 @@ def main() -> None:
             tensorboard_log=tensorboard_log,
             n_steps=1024,
             batch_size=256,
-            policy_kwargs={"features_extractor_class": RoverTerrainExtractor},
+            # The direct eight-motor action space is much easier to destabilise
+            # than the earlier base-twist action. Keep PPO updates deliberately
+            # small: the previous defaults produced approx_kl around 0.6--1.0
+            # and clip fractions near 0.7, indicating policy collapse.
+            learning_rate=1e-4,
+            n_epochs=5,
+            target_kl=0.02,
+            policy_kwargs={
+                "features_extractor_class": RoverTerrainExtractor,
+                # Start with less random motor command variation. PPO can
+                # still learn its own action standard deviation afterwards.
+                "log_std_init": -1.0,
+            },
         )
     else:
         print(f"Resuming PPO policy from {args.resume}")
