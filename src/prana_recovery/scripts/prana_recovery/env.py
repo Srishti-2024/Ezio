@@ -545,28 +545,38 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         truncated = self._step_count >= self.max_episode_steps
 
         # Target-free reward: get meaningfully away from the stuck start while
-        # preferring sustained, upright, smooth translation over thrashing.
-        # Contact release is a dense signal for high-centred starts: it rewards
-        # breaking free, but only when the number of chassis contacts drops.
+        # preferring sustained, upright translation. Uprightness is gated by
+        # movement: the earlier standalone upright reward made a level rover
+        # earn about +3 by waiting for a whole episode.
         energy = float(np.square(action).mean())
         action_change = float(np.square(action - self._last_action).mean())
         uprightness = max(0.0, 1.0 - (abs(roll_rad) + abs(pitch_rad)) / 0.70)
         sustained_motion = min(planar_speed_m_s / 0.45, 1.0)
         contact_release = float(np.clip(self._previous_body_contacts - body_contacts, -2, 2))
+        # Do not punish the initial wheel-steering/setup phase, or an active
+        # rover that is still loading tyres against a wall. This only detects
+        # the policy's "give up" solution: little translation and almost no
+        # motor command after two seconds.
+        passive = (
+            self._step_count > 40
+            and planar_speed_m_s < 0.03
+            and float(np.mean(np.abs(action))) < 0.12
+        )
         reward = (
             7.0 * progress_m
-            + 0.04 * sustained_motion
-            + 0.02 * uprightness
+            + 0.06 * sustained_motion * uprightness
             + 0.30 * contact_release
-            - 0.01
-            - 0.020 * energy
-            - 0.015 * action_change
-            - 0.04 * body_contacts
+            - 0.015
+            - 0.005 * energy
+            - 0.003 * action_change
+            - 0.03 * body_contacts
         )
+        if passive:
+            reward -= 0.03
         if success:
-            reward += 25.0
+            reward += 30.0
         if tipped:
-            reward -= 12.0
+            reward -= 5.0
         self._previous_body_contacts = body_contacts
         self._last_action = action.astype(np.float32)
         return self._observation(), float(reward), terminated, truncated, self._info(success=success, tipped=tipped)
