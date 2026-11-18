@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=10_000)
     parser.add_argument("--bowl-depth", type=float, default=1.4)
     parser.add_argument("--bowl-radius", type=float, default=2.5)
+    parser.add_argument("--surface-friction", type=float, default=1.0)
+    parser.add_argument("--max-wheel-speed", type=float, default=6.5)
     parser.add_argument("--spawn-radius", type=float, default=0.25)
     parser.add_argument("--escape-margin", type=float, default=0.30)
     parser.add_argument("--max-episode-steps", type=int, default=400)
@@ -41,10 +43,16 @@ def main() -> None:
     if args.episodes < 1 or args.render_every < 1 or args.history_frames < 1 or args.max_episode_steps < 1:
         raise SystemExit("episode, render, history, and maximum-step counts must be positive.")
     config = BowlConfig(
-        depth_m=args.bowl_depth, rim_radius_m=args.bowl_radius,
+        depth_m=args.bowl_depth, rim_radius_m=args.bowl_radius, surface_friction=args.surface_friction,
         spawn_radius_m=args.spawn_radius, escape_margin_m=args.escape_margin,
     )
-    environment = BowlRecoveryEnv(bowl_config=config, max_episode_steps=args.max_episode_steps, history_frames=args.history_frames, seed=args.seed)
+    environment = BowlRecoveryEnv(
+        bowl_config=config,
+        max_episode_steps=args.max_episode_steps,
+        history_frames=args.history_frames,
+        max_wheel_linear_speed_m_s=args.max_wheel_speed,
+        seed=args.seed,
+    )
     policy = PPO.load(args.model)
     expected_state = (36 * args.history_frames,)
     expected_terrain = (2 * args.history_frames, 32, 32)

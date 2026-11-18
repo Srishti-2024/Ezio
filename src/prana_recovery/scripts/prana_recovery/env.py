@@ -92,6 +92,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         mobility_displacement_m: float = 0.50,
         mobility_path_m: float = 0.60,
         record_precheck_frames: bool = False,
+        max_wheel_linear_speed_m_s: float = MAX_WHEEL_LINEAR_SPEED_M_S,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -119,6 +120,8 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             raise ValueError("history, precheck, and mobility window counts must be positive.")
         if precheck_translation_m <= 0.0 or mobility_displacement_m <= 0.0 or mobility_path_m <= 0.0:
             raise ValueError("translation and mobility thresholds must be positive.")
+        if max_wheel_linear_speed_m_s <= 0.0:
+            raise ValueError("max_wheel_linear_speed_m_s must be positive.")
         self.spawn_contact_clearance_m = spawn_contact_clearance_m
         self.settle_max_steps = settle_max_steps
         self.settle_stable_steps = settle_stable_steps
@@ -133,6 +136,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self.mobility_displacement_m = mobility_displacement_m
         self.mobility_path_m = mobility_path_m
         self.record_precheck_frames = record_precheck_frames
+        self.max_wheel_linear_speed_m_s = max_wheel_linear_speed_m_s
         self._rng = np.random.default_rng(seed)
         self._temporary_directory = tempfile.TemporaryDirectory(prefix="prana_recovery_")
         self._model: mujoco.MjModel | None = None
@@ -512,7 +516,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
 
     def _twist_probe_action(self, vx: float, vy: float, wz: float) -> np.ndarray:
         steering, wheel_angular_velocity = body_twist_to_wheels(vx, vy, wz)
-        drive = wheel_angular_velocity * WHEEL_RADIUS_M / self.MAX_WHEEL_LINEAR_SPEED_M_S
+        drive = wheel_angular_velocity * WHEEL_RADIUS_M / self.max_wheel_linear_speed_m_s
         steer = steering / self.MAX_STEERING_ANGLE_RAD
         return np.clip(np.concatenate((drive, steer)), -1.0, 1.0)
 
@@ -583,7 +587,7 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
 
     def _apply_direct_action(self, action: np.ndarray) -> None:
         """Map normalized direct motor commands to MuJoCo actuator targets."""
-        drive_linear_speed = action[:4] * self.MAX_WHEEL_LINEAR_SPEED_M_S
+        drive_linear_speed = action[:4] * self.max_wheel_linear_speed_m_s
         steering_target = action[4:] * self.MAX_STEERING_ANGLE_RAD
         for actuator_id, target in zip(self._drive_ids, drive_linear_speed / WHEEL_RADIUS_M, strict=True):
             self.data.ctrl[actuator_id] = target
@@ -701,11 +705,20 @@ class PranaRecoveryEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     def _wheel_contact_mask(self) -> np.ndarray:
         """Return one ground-contact bit per tyre in fixed wheel order."""
         contacted = np.zeros(len(WHEEL_NAMES), dtype=np.float32)
-        wheel_geom_to_index = {f"wheel_{wheel}_visual": index for index, wheel in enumerate(WHEEL_NAMES)}
+        # The compiled wheel mesh geoms intentionally have no explicit names,
+        # so looking them up as ``wheel_fl_visual`` silently produced an
+        # all-zero contact mask. Identify every geom attached to each wheel
+        # body instead.
+        wheel_geom_to_index: dict[int, int] = {}
+        for wheel_index, wheel in enumerate(WHEEL_NAMES):
+            wheel_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"wheel_{wheel}")
+            first_geom = self.model.body_geomadr[wheel_body_id]
+            for geom_id in range(first_geom, first_geom + self.model.body_geomnum[wheel_body_id]):
+                wheel_geom_to_index[geom_id] = wheel_index
         for contact_index in range(self.data.ncon):
             contact = self.data.contact[contact_index]
             for geom_id in (contact.geom1, contact.geom2):
-                wheel_index = wheel_geom_to_index.get(self.model.geom(geom_id).name)
+                wheel_index = wheel_geom_to_index.get(geom_id)
                 if wheel_index is not None:
                     contacted[wheel_index] = 1.0
         return contacted

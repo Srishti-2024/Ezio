@@ -23,29 +23,38 @@ class BowlConfig:
     resolution: int = 257
     rim_radius_m: float = 2.5
     depth_m: float = 1.4
+    surface_friction: float = 1.0
     spawn_radius_m: float = 0.25
     escape_margin_m: float = 0.30
 
 
 class ParabolicBowl:
-    """Deterministic hfield plus analytic terrain queries for one bowl."""
+    """A C1-smooth bowl: steep middle wall, flat terrain beyond the rim."""
 
     def __init__(self, config: BowlConfig, seed: int) -> None:
         if not 0.0 < config.rim_radius_m < config.half_extent_m:
             raise ValueError("bowl rim radius must be inside the terrain extent.")
-        if config.depth_m <= 0.0 or config.spawn_radius_m < 0.0:
-            raise ValueError("bowl depth must be positive and spawn radius cannot be negative.")
+        if config.depth_m <= 0.0 or config.spawn_radius_m < 0.0 or config.surface_friction <= 0.0:
+            raise ValueError("bowl depth/friction must be positive and spawn radius cannot be negative.")
         self.config = config
         self.seed = int(seed)
         coords = np.linspace(-config.half_extent_m, config.half_extent_m, config.resolution)
         x, y = np.meshgrid(coords, coords, indexing="xy")
-        self.heights_m = config.depth_m * np.minimum((x * x + y * y) / config.rim_radius_m**2, 1.0)
+        radius_ratio = np.minimum(np.sqrt(x * x + y * y) / config.rim_radius_m, 1.0)
+        # ``2s² - s⁴`` is parabolic near the centre and has zero derivative
+        # at s=1. The old clipped s² bowl had a sudden slope change from a
+        # ~50° wall to flat ground, creating an artificial sharp lip.
+        self.heights_m = config.depth_m * (2.0 * radius_ratio**2 - radius_ratio**4)
 
     def height_at(self, x_m: float, y_m: float) -> float:
-        return float(self.config.depth_m * min((x_m * x_m + y_m * y_m) / self.config.rim_radius_m**2, 1.0))
+        radius_ratio = min(math.hypot(x_m, y_m) / self.config.rim_radius_m, 1.0)
+        return float(self.config.depth_m * (2.0 * radius_ratio**2 - radius_ratio**4))
 
     def slope_at_radius(self, radius_m: float) -> float:
-        return 0.0 if radius_m > self.config.rim_radius_m else 2.0 * self.config.depth_m * radius_m / self.config.rim_radius_m**2
+        if radius_m >= self.config.rim_radius_m:
+            return 0.0
+        s = radius_m / self.config.rim_radius_m
+        return 4.0 * self.config.depth_m / self.config.rim_radius_m * s * (1.0 - s * s)
 
     def write_hfield(self, path: Path) -> None:
         normalized = self.heights_m / self.config.depth_m
@@ -99,13 +108,22 @@ class BowlRecoveryEnv(PranaRecoveryEnv):
   </asset>
   <worldbody>
     <light pos="0 0 8" dir="0 0 -1" directional="true"/>
-    <geom name="bowl_terrain_geom" type="hfield" hfield="bowl_terrain" friction="1.8 0.01 0.001" rgba="0.25 0.20 0.14 1"/>
+    <geom name="bowl_terrain_geom" type="hfield" hfield="bowl_terrain" friction="{self.bowl_config.surface_friction} 0.01 0.001" rgba="0.25 0.20 0.14 1"/>
   </worldbody>
   <include file="{compiled_path}"/>
 </mujoco>''',
             encoding="utf-8",
         )
         self._model = mujoco.MjModel.from_xml_path(str(scene_path))
+        # MuJoCo combines material properties from both colliding geoms. The
+        # compiled rover wheels otherwise retain their old 1.8 value, which
+        # would defeat lowering only the terrain friction above.
+        for wheel in ("fl", "fr", "lb", "rb"):
+            wheel_body_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, f"wheel_{wheel}")
+            first_geom = self._model.body_geomadr[wheel_body_id]
+            geom_count = self._model.body_geomnum[wheel_body_id]
+            for wheel_geom_id in range(first_geom, first_geom + geom_count):
+                self._model.geom_friction[wheel_geom_id, 0] = self.bowl_config.surface_friction
         self._data = mujoco.MjData(self._model)
         self._steering_ids, self._drive_ids = actuator_ids(self._model)
         free_joint = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, "prana_mark2_v2_freejoint")

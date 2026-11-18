@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, help="Continue a bowl checkpoint; timesteps are additional.")
     parser.add_argument("--bowl-depth", type=float, default=1.4, help="Rim height above bowl floor in metres")
     parser.add_argument("--bowl-radius", type=float, default=2.5, help="Bowl rim radius in metres")
+    parser.add_argument("--surface-friction", type=float, default=1.0, help="Shared tyre/bowl sliding friction (default: 1.0)")
+    parser.add_argument("--max-wheel-speed", type=float, default=6.5, help="Wheel linear-speed target at action magnitude 1 (default: 6.5 m/s)")
     parser.add_argument("--spawn-radius", type=float, default=0.25, help="Maximum centre-start jitter in metres")
     parser.add_argument("--escape-margin", type=float, default=0.30, help="Metres beyond rim required for success")
     parser.add_argument("--max-episode-steps", type=int, default=400)
@@ -45,14 +47,15 @@ def main() -> None:
         raise SystemExit("Install src/prana_recovery/requirements-training.txt first.") from error
     if min(args.timesteps, args.num_envs, args.max_episode_steps, args.history_frames, args.render_envs, args.render_every, args.checkpoint_every) < 1:
         raise SystemExit("step counts and environment counts must be positive.")
-    if args.bowl_depth <= 0.0 or args.bowl_radius <= 0.0 or args.spawn_radius < 0.0 or args.escape_margin < 0.0:
-        raise SystemExit("Bowl depth/radius must be positive; spawn radius and escape margin cannot be negative.")
+    if args.bowl_depth <= 0.0 or args.bowl_radius <= 0.0 or args.surface_friction <= 0.0 or args.max_wheel_speed <= 0.0 or args.spawn_radius < 0.0 or args.escape_margin < 0.0:
+        raise SystemExit("Bowl depth/radius/friction must be positive; spawn radius and escape margin cannot be negative.")
     if args.resume is not None and not (args.resume.exists() or args.resume.with_suffix(".zip").exists()):
         raise SystemExit(f"Could not find resume model: {args.resume}")
     args.output.mkdir(parents=True, exist_ok=True)
     bowl_config = BowlConfig(
         depth_m=args.bowl_depth,
         rim_radius_m=args.bowl_radius,
+        surface_friction=args.surface_friction,
         spawn_radius_m=args.spawn_radius,
         escape_margin_m=args.escape_margin,
     )
@@ -63,6 +66,7 @@ def main() -> None:
                 bowl_config=bowl_config,
                 max_episode_steps=args.max_episode_steps,
                 history_frames=args.history_frames,
+                max_wheel_linear_speed_m_s=args.max_wheel_speed,
                 seed=worker_seed,
             )
         return factory
@@ -83,7 +87,12 @@ def main() -> None:
     if args.render:
         callbacks.append(TrainingMosaicCallback(every_steps=args.render_every, worker_count=min(args.render_envs, args.num_envs)))
     try:
-        model.learn(total_timesteps=args.timesteps, reset_num_timesteps=args.resume is None, callback=callbacks)
+        model.learn(
+            total_timesteps=args.timesteps,
+            reset_num_timesteps=args.resume is None,
+            progress_bar=True,
+            callback=callbacks,
+        )
     except KeyboardInterrupt:
         model.save(args.output / "ppo_prana_bowl_interrupted")
         print("Interrupted: saved ppo_prana_bowl_interrupted.")
